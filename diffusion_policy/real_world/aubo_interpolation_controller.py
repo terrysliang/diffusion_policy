@@ -154,27 +154,6 @@ class AuboInterpolationController(mp.Process):
     def get_all_state(self):
         return self.ring_buffer.get_all()
 
-    def wait_arrival(self, robot_interface):
-        max_retry_count = 5
-        cnt = 0
-
-        # 接口调用: 获取当前的运动指令 ID
-        exec_id = robot_interface.getMotionControl().getExecId()
-
-        # 等待机械臂开始运动
-        while exec_id == -1:
-            if cnt > max_retry_count:
-                return -1
-            time.sleep(0.05)
-            cnt += 1
-            exec_id = robot_interface.getMotionControl().getExecId()
-
-        # 等待机械臂运动完成
-        while robot_interface.getMotionControl().getExecId() != -1:
-            time.sleep(0.05)
-
-        return 0
-
     def run(self):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN) # ignore ctrl-c
