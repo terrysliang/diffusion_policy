@@ -191,8 +191,8 @@ class AuboInterpolationController(mp.Process):
         mc = robot_interface.getMotionControl()
 
         # Set TCP offset if specified
-        if self.tcp_offset_pose is not None:
-            robot_interface.getKinematics().setToolFrame(self.tcp_offset_pose.tolist())
+        # if self.tcp_offset_pose is not None:
+        #     robot_interface.getKinematics().setToolFrame(self.tcp_offset_pose.tolist())
 
         # Init joints if specified
         if self.joints_init is not None:
