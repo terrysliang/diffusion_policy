@@ -33,7 +33,7 @@ class AuboInterpolationController(mp.Process):
             receive_keys=None,
             get_max_k=128,
             ):
-        assert 0 < frequency <= 125   # for safety, Aubo real-time control is not 500Hz!
+        assert 0 < frequency <= 200   # for safety, Aubo real-time control is not 500Hz!
         if tcp_offset_pose is not None:
             tcp_offset_pose = np.array(tcp_offset_pose)
             assert tcp_offset_pose.shape == (6,)
@@ -227,7 +227,16 @@ class AuboInterpolationController(mp.Process):
 
                 # Send servo command (cartesian)
                 # Aubo's API: servoCartesian(pose, vx, vy, period, acceleration, jerk)
-                mc.servoCartesian(pose_command.tolist(), 0, 0, dt, 0, 0)
+
+                ret = mc.servoCartesian(pose_command.tolist(), 0, 0, dt, 0, 0)
+
+                if ret == -13:
+                    mc.setServoMode(True)
+                    time.sleep(0.005)                   
+                    ret = mc.servoCartesian(pose_command.tolist(), 0, 0, dt, 0, 0)
+
+                # print(f"[AuboInterpolationController] Iteration {ret}, sending pose command: {pose_command}")
+
 
                 # Get state (fill keys as available)
                 state = dict()

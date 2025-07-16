@@ -138,23 +138,39 @@ class Spacemouse(mp.Process):
             })
             self.ready_event.set()
 
+            idle_cycles = 0
+            idle_threshold = 2  # Number of cycles to wait before forcing zero
+
             while not self.stop_event.is_set():
                 event = spnav_poll_event()
                 receive_timestamp = time.time()
+                updated = False
+
                 if isinstance(event, SpnavMotionEvent):
                     motion_event[:3] = event.translation
                     motion_event[3:6] = event.rotation
                     motion_event[6] = event.period
+                    updated = True
+                    idle_cycles = 0  # Reset idle counter on motion event
                 elif isinstance(event, SpnavButtonEvent):
                     button_state[event.bnum] = event.press
+                    updated = True
                 else:
-                    # finish integrating this round of events
-                    # before sending over
+                    idle_cycles += 1
+                    # If idle too long, force all motion to zero (but keep buttons)
+                    if idle_cycles > idle_threshold:
+                        if not np.all(motion_event[:6] == 0):
+                            motion_event[:6] = 0
+                            updated = True
+
+                if updated:
                     self.ring_buffer.put({
                         'motion_event': motion_event,
                         'button_state': button_state,
                         'receive_timestamp': receive_timestamp
                     })
-                    time.sleep(1/self.frequency)
+
+                time.sleep(1/self.frequency)
         finally:
             spnav_close()
+

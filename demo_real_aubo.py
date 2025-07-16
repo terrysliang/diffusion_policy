@@ -115,9 +115,10 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
 
                 # ===== SpaceMouse Motion Logic with Locking =====
                 sm_state = sm.get_motion_state_transformed()
-                dpos = sm_state[:3] * (env.max_pos_speed / frequency)
-                drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)
+                spacemouse_scale = 0.5
 
+                dpos = sm_state[:3] * spacemouse_scale * (env.max_pos_speed / frequency)
+                drot_xyz = sm_state[3:] * spacemouse_scale * (env.max_rot_speed / frequency)
                 if lock_state == 0:  # Nothing locked
                     pass
                 elif lock_state == 1:  # Position locked
@@ -128,6 +129,8 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 drot = st.Rotation.from_euler('xyz', drot_xyz)
                 target_pose[:3] += dpos
                 target_pose[3:] = (drot * st.Rotation.from_rotvec(target_pose[3:])).as_rotvec()
+
+                # print(f"[Teleop Debug] dpos: {dpos}, drot_xyz: {drot_xyz}, target_pose: {target_pose}")
 
                 # ===== Visualization =====
                 vis_img = obs[f'camera_{vis_camera_idx}'][-1, :, :, ::-1].copy()

@@ -40,7 +40,7 @@ class RealEnv:
             obs_key_map=DEFAULT_OBS_KEY_MAP,
             obs_float32=False,
             max_pos_speed=0.25,
-            max_rot_speed=0.6,
+            max_rot_speed=0.16,
             tcp_offset=None,
             init_joints=False,
             video_capture_fps=30,
@@ -138,7 +138,7 @@ class RealEnv:
             )
 
         cube_diag = np.linalg.norm([1,1,1])
-        j_init = np.array([0,-90,-90,-90,90,0]) / 180 * np.pi
+        j_init = np.array([-90,0,90,90,90,0]) / 180 * np.pi
         if not init_joints:
             j_init = None
 
