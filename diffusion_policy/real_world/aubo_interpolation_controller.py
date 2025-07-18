@@ -178,13 +178,13 @@ class AuboInterpolationController(mp.Process):
             if self.verbose:
                 print("[AuboInterpolationController] RPC client connected and logged in.")
 
-        rtde_client = pyaubo_sdk.RtdeClient()
-        ret = rtde_client.connect(robot_ip, 30010)
-        assert ret == 0, f"Failed to connect, error code: {ret}"
-        if rtde_client.hasConnected():
-            rtde_client.login("aubo", "123456")
-            if self.verbose:
-                print("[AuboInterpolationController] RTDE client connected and logged in.")
+        # rtde_client = pyaubo_sdk.RtdeClient()
+        # ret = rtde_client.connect(robot_ip, 30010)
+        # assert ret == 0, f"Failed to connect, error code: {ret}"
+        # if rtde_client.hasConnected():
+        #     rtde_client.login("aubo", "123456")
+        #     if self.verbose:
+        #         print("[AuboInterpolationController] RTDE client connected and logged in.")
 
         robot_name = rpc_client.getRobotNames()[0]
         robot_interface = rpc_client.getRobotInterface(robot_name)
@@ -313,7 +313,7 @@ class AuboInterpolationController(mp.Process):
             mc.setServoMode(False)
             time.sleep(0.1)
             rpc_client.disconnect()
-            rtde_client.disconnect()
+            # rtde_client.disconnect()
             self.ready_event.set()
             if self.verbose:
                 print(f"[AuboInterpolationController] Disconnected from robot: {robot_ip}")
