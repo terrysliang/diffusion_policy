@@ -65,6 +65,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
             last_lock_button = False
             gripper_closed = False
             last_gripper_button = False
+            gripper.set_closed(gripper_closed)
 
             while not stop:
                 t_cycle_end = t_start + (iter_idx + 1) * dt
