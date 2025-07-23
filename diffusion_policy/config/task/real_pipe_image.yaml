@@ -1,37 +1,37 @@
-name: real_image
+name: real_pipe
 
 image_shape: [3, 240, 320]
-dataset_path: data/pusht_real/real_pusht_20230105
+dataset_path: data/pipe_real/real_pipe_20250728
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
-    # camera_0:
-    #   shape: ${task.image_shape}
-    #   type: rgb
+    camera_0:
+      shape: ${task.image_shape}
+      type: rgb
     camera_1:
       shape: ${task.image_shape}
       type: rgb
-    # camera_2:
-    #   shape: ${task.image_shape}
-    #   type: rgb
+    camera_2:
+      shape: ${task.image_shape}
+      type: rgb
     camera_3:
       shape: ${task.image_shape}
       type: rgb
-    # camera_4:
-    #   shape: ${task.image_shape}
-    #   type: rgb
     robot_eef_pose:
-      shape: [2]
+      shape: [6]
+      type: low_dim
+    robot_gripper_qpos:
+      shape: [1]
       type: low_dim
   action: 
-    shape: [2]
+    shape: [7]
 
 env_runner:
-  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+  _target_: diffusion_policy.env_runner.real_pipe_image_runner.RealPipeImageRunner
 
 dataset:
-  _target_: diffusion_policy.dataset.real_pusht_image_dataset.RealPushTImageDataset
+  _target_: diffusion_policy.dataset.real_pipe_image_dataset.RealPipeImageDataset
   shape_meta: *shape_meta
   dataset_path: ${task.dataset_path}
   horizon: ${horizon}

@@ -74,6 +74,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
 
                 # pump obs
                 obs = env.get_obs()
+                obs['robot_gripper_qpos'] = np.array([float(gripper_closed)], dtype=np.float32)
 
                 # handle key presses
                 press_events = key_counter.get_press_events()
@@ -158,7 +159,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
 
                 # ===== Execute Teleop Command =====
                 env.exec_actions(
-                    actions=[target_pose], 
+                    actions=[np.concatenate([target_pose, [float(gripper_closed)]])], 
                     timestamps=[t_command_target - time.monotonic() + time.time()],
                     stages=[stage]
                 )
