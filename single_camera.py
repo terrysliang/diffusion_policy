@@ -218,6 +218,7 @@ class SingleCamera(mp.Process):
         cv2.setNumThreads(1)
 
         cap = cv2.VideoCapture(self.device_id)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
         cap.set(cv2.CAP_PROP_FPS, self.capture_fps)
@@ -234,6 +235,8 @@ class SingleCamera(mp.Process):
             if not ret:
                 print(f"[SingleCamera] Frame grab failed.")
                 continue
+            if frame.shape[0] != self.resolution[1] or frame.shape[1] != self.resolution[0]:
+                print(f"[SingleCamera] Warning: camera returned shape {frame.shape}, expected {(self.resolution[1], self.resolution[0])}")
             receive_time = time.time()
             data = dict()
             if self.enable_color:
@@ -336,7 +339,7 @@ class SingleCamera(mp.Process):
 # Example usage
 if __name__ == '__main__':
     with SharedMemoryManager() as shm_mgr:
-        cam = SingleCamera(shm_mgr, device_id=0, resolution=(640,480))
+        cam = SingleCamera(shm_mgr, device_id=8, resolution=(1280,720))
         cam.start()
         cam.start_wait()
         print('Camera ready:', cam.is_ready)

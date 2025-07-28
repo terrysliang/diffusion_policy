@@ -37,7 +37,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[0, 2]
+                device_ids=[0, 8]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 
@@ -159,7 +159,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
 
                 # ===== Execute Teleop Command =====
                 env.exec_actions(
-                    actions=[np.concatenate([target_pose, [float(gripper_closed)]])], 
+                    actions=[target_pose], 
                     timestamps=[t_command_target - time.monotonic() + time.time()],
                     stages=[stage]
                 )
