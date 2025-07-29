@@ -56,10 +56,6 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
             state = env.get_robot_state()
             target_pose = state['TargetTCPPose'].copy()  # Avoid mutating original
             
-            euler = np.array(target_pose[3:])
-            rotvec = st.Rotation.from_euler('xyz', euler).as_rotvec()
-            target_pose[3:] = rotvec
-
             t_start = time.monotonic()
             iter_idx = 0
             stop = False

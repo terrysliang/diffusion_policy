@@ -193,14 +193,14 @@ class AuboInterpolationController(mp.Process):
             time.sleep(2.0)
 
         # Enable servo mode
-        # mc.setServoMode(True)
-        # i = 0
-        # while not mc.isServoModeEnabled():
-        #     i = i + 1
-        #     if i > 5:
-        #         print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
-        #         return -1
-        #     time.sleep(0.005)
+        mc.setServoMode(True)
+        i = 0
+        while not mc.isServoModeEnabled():
+            i = i + 1
+            if i > 5:
+                print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
+                return -1
+            time.sleep(0.005)
 
         try:
             curr_pose_euler = robot_interface.getRobotState().getTcpPose()
@@ -235,22 +235,24 @@ class AuboInterpolationController(mp.Process):
                         time.sleep(0.005)
 
                 ret = mc.servoCartesian(pose_euler, 0, 0, dt, 0, 0)
-
-                # if ret == -13:
-                #     mc.setServoMode(True)
-                #     time.sleep(0.005)                   
-                #     ret = mc.servoCartesian(pose_euler, 0, 0, dt, 0, 0)
+                
                 if ret != 0:
                     print(f"[AuboInterpolationController] Return Value {ret}, sending pose command: {pose_command}, current pose: {curr_pose}")
 
 
                 # Get state (fill keys as available)
                 state = dict()
-                state['ActualTCPPose'] = np.array(robot_interface.getRobotState().getTcpPose())
+                tcp_pose = robot_interface.getRobotState().getTcpPose()
+                tcp_pose = np.array(tcp_pose)
+                actual_pose_rotvec = np.concatenate([
+                    tcp_pose[:3],
+                    R.from_euler('xyz', tcp_pose[3:]).as_rotvec()
+                ])
+                state['ActualTCPPose'] = actual_pose_rotvec
                 state['ActualTCPSpeed'] = np.array(robot_interface.getRobotState().getTcpSpeed())
                 state['ActualQ'] = np.array(robot_interface.getRobotState().getJointPositions())
                 state['ActualQd'] = np.array(robot_interface.getRobotState().getJointSpeeds())
-                state['TargetTCPPose'] = np.array(pose_euler)
+                state['TargetTCPPose'] = np.array(pose_command)
                 state['TargetTCPSpeed'] = np.zeros((6,))
                 state['TargetQ'] = np.zeros((6,))
                 state['TargetQd'] = np.zeros((6,))
