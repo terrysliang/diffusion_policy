@@ -55,6 +55,11 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
             print('Ready!')
             state = env.get_robot_state()
             target_pose = state['TargetTCPPose'].copy()  # Avoid mutating original
+            
+            euler = np.array(target_pose[3:])
+            rotvec = st.Rotation.from_euler('xyz', euler).as_rotvec()
+            target_pose[3:] = rotvec
+
             t_start = time.monotonic()
             iter_idx = 0
             stop = False
@@ -128,9 +133,11 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 elif lock_state == 2:  # Orientation locked
                     drot_xyz[:] = 0
 
-                drot = st.Rotation.from_euler('xyz', drot_xyz)
                 target_pose[:3] += dpos
-                target_pose[3:] = (drot * st.Rotation.from_rotvec(target_pose[3:])).as_rotvec()
+
+                if not np.allclose(drot_xyz, 0):
+                    drot = st.Rotation.from_euler('xyz', drot_xyz)
+                    target_pose[3:] = (drot * st.Rotation.from_rotvec(target_pose[3:])).as_rotvec()
 
                 # print(f"[Teleop Debug] dpos: {dpos}, drot_xyz: {drot_xyz}, target_pose: {target_pose}")
 

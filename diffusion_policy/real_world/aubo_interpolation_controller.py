@@ -3,6 +3,7 @@ import time
 import enum
 import multiprocessing as mp
 from multiprocessing.managers import SharedMemoryManager
+from scipy.spatial.transform import Rotation as R
 import numpy as np
 import pyaubo_sdk
 
@@ -178,14 +179,6 @@ class AuboInterpolationController(mp.Process):
             if self.verbose:
                 print("[AuboInterpolationController] RPC client connected and logged in.")
 
-        # rtde_client = pyaubo_sdk.RtdeClient()
-        # ret = rtde_client.connect(robot_ip, 30010)
-        # assert ret == 0, f"Failed to connect, error code: {ret}"
-        # if rtde_client.hasConnected():
-        #     rtde_client.login("aubo", "123456")
-        #     if self.verbose:
-        #         print("[AuboInterpolationController] RTDE client connected and logged in.")
-
         robot_name = rpc_client.getRobotNames()[0]
         robot_interface = rpc_client.getRobotInterface(robot_name)
         mc = robot_interface.getMotionControl()
@@ -200,17 +193,19 @@ class AuboInterpolationController(mp.Process):
             time.sleep(2.0)
 
         # Enable servo mode
-        mc.setServoMode(True)
-        i = 0
-        while not mc.isServoModeEnabled():
-            i = i + 1
-            if i > 5:
-                print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
-                return -1
-            time.sleep(0.005)
+        # mc.setServoMode(True)
+        # i = 0
+        # while not mc.isServoModeEnabled():
+        #     i = i + 1
+        #     if i > 5:
+        #         print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
+        #         return -1
+        #     time.sleep(0.005)
 
         try:
-            curr_pose = robot_interface.getRobotState().getTcpPose()
+            curr_pose_euler = robot_interface.getRobotState().getTcpPose()
+            curr_pose = np.array(curr_pose_euler[:3] + R.from_euler('xyz', curr_pose_euler[3:]).as_rotvec().tolist())
+
             curr_t = time.monotonic()
             last_waypoint_time = curr_t
             pose_interp = PoseTrajectoryInterpolator(
@@ -224,18 +219,29 @@ class AuboInterpolationController(mp.Process):
                 t_start = time.perf_counter()
                 t_now = time.monotonic()
                 pose_command = pose_interp(t_now)
+                pose_euler = pose_command[:3].tolist() + R.from_rotvec(pose_command[3:]).as_euler('xyz').tolist()
 
                 # Send servo command (cartesian)
                 # Aubo's API: servoCartesian(pose, vx, vy, period, acceleration, jerk)
 
-                ret = mc.servoCartesian(pose_command.tolist(), 0, 0, dt, 0, 0)
-
-                if ret == -13:
+                if not mc.isServoModeEnabled():
                     mc.setServoMode(True)
-                    time.sleep(0.005)                   
-                    ret = mc.servoCartesian(pose_command.tolist(), 0, 0, dt, 0, 0)
+                    i = 0
+                    while not mc.isServoModeEnabled():
+                        i = i + 1
+                        if i > 5:
+                            print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
+                            return -1
+                        time.sleep(0.005)
 
-                # print(f"[AuboInterpolationController] Iteration {ret}, sending pose command: {pose_command}")
+                ret = mc.servoCartesian(pose_euler, 0, 0, dt, 0, 0)
+
+                # if ret == -13:
+                #     mc.setServoMode(True)
+                #     time.sleep(0.005)                   
+                #     ret = mc.servoCartesian(pose_euler, 0, 0, dt, 0, 0)
+                if ret != 0:
+                    print(f"[AuboInterpolationController] Return Value {ret}, sending pose command: {pose_command}, current pose: {curr_pose}")
 
 
                 # Get state (fill keys as available)
@@ -244,7 +250,7 @@ class AuboInterpolationController(mp.Process):
                 state['ActualTCPSpeed'] = np.array(robot_interface.getRobotState().getTcpSpeed())
                 state['ActualQ'] = np.array(robot_interface.getRobotState().getJointPositions())
                 state['ActualQd'] = np.array(robot_interface.getRobotState().getJointSpeeds())
-                state['TargetTCPPose'] = np.array(pose_command)
+                state['TargetTCPPose'] = np.array(pose_euler)
                 state['TargetTCPSpeed'] = np.zeros((6,))
                 state['TargetQ'] = np.zeros((6,))
                 state['TargetQd'] = np.zeros((6,))
@@ -306,8 +312,8 @@ class AuboInterpolationController(mp.Process):
                 if iter_idx == 0:
                     self.ready_event.set()
                 iter_idx += 1
-                # if self.verbose:
-                #     print(f"[AuboInterpolationController] Actual frequency {1/(time.perf_counter() - t_start)}")
+                if self.verbose:
+                    print(f"[AuboInterpolationController] Actual frequency {1/(time.perf_counter() - t_start)}")
 
         finally:
             mc.setServoMode(False)
