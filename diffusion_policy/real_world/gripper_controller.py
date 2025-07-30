@@ -51,7 +51,7 @@ class GripperController:
         # Set default force and speed using correct registers
         FORCE_REGISTER = 0x0101  # 20–100 (%)
         SPEED_REGISTER = 0x0104  # 1–100 (%)
-        self.client.write_register(FORCE_REGISTER, 50, unit=self.slave_id)
+        self.client.write_register(FORCE_REGISTER, 80, unit=self.slave_id)
         time.sleep(0.05)
         self.client.write_register(SPEED_REGISTER, 80, unit=self.slave_id)
         time.sleep(0.05)
@@ -78,20 +78,20 @@ class GripperController:
                 print(f"Failed to read gripper state: {state}")
                 continue
             status = state.registers[0]
-            print(f"Gripper state: {status}")
+            # print(f"Gripper state: {status}")
             if status in [1, 2, 3]:  # 1: reached position, 2: object caught, 3: dropped
                 break
             time.sleep(0.1)
 
         # Read actual gripper position
         pos = self.client.read_holding_registers(ACTUAL_POSITION_REGISTER, 1, unit=self.slave_id)
-        if not pos.isError():
+        if pos.isError():
             print(f"Actual gripper position: {pos.registers[0]}")
 
         return True
 
     def set_closed(self, closed=True):
-        pos = 50 if closed else 500
+        pos = 150 if closed else 500
         return self.set_gripper_position(pos)
 
     def open(self):

@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import scipy.spatial.transform as st
 from diffusion_policy.real_world.real_env_aubo import RealEnv
-from diffusion_policy.real_world.gripper_controller import GripperController  # Make sure this matches your actual import
+from diffusion_policy.real_world.gripper_controller import GripperController
 from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.keystroke_counter import (
@@ -37,7 +37,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[0, 8]
+                device_ids=[6, 4, 15]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 
