@@ -15,17 +15,11 @@ shape_meta: &shape_meta
     camera_2:
       shape: ${task.image_shape}
       type: rgb
-    camera_3:
-      shape: ${task.image_shape}
-      type: rgb
     robot_eef_pose:
       shape: [6]
       type: low_dim
-    robot_gripper_qpos:
-      shape: [1]
-      type: low_dim
   action: 
-    shape: [7]
+    shape: [6]
 
 env_runner:
   _target_: diffusion_policy.env_runner.real_pipe_image_runner.RealPipeImageRunner

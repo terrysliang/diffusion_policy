@@ -37,7 +37,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[6, 4, 15]
+                device_ids=[18, 8, 0]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 
@@ -92,6 +92,10 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                         key_counter.clear()
                         is_recording = False
                         print('Stopped.')
+                    # elif key_stroke == KeyCode(char='i'):
+                    #     env.robot  @TODO: map a key that move the robot to its initial pose
+                    #     key_counter.clear()
+                    #     print('Moving to init pose.')
                     elif key_stroke == Key.backspace:
                         if click.confirm('Are you sure to drop an episode?'):
                             env.drop_episode()

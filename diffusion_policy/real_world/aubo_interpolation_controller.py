@@ -190,7 +190,7 @@ class AuboInterpolationController(mp.Process):
         # Init joints if specified
         if self.joints_init is not None:
             mc.moveJoint(self.joints_init.tolist(), self.joints_init_speed, self.joints_init_speed, 0., 0.)
-            time.sleep(2.0)
+            time.sleep(3.0)
 
         # Enable servo mode
         mc.setServoMode(True)
