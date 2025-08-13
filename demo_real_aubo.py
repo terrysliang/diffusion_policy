@@ -29,7 +29,8 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
             RealEnv(
                 output_dir=output, 
                 robot_ip=robot_ip, 
-                obs_image_resolution=(1280, 720),
+                obs_image_resolution=(640,480),
+                video_capture_resolution=(640,480),
                 frequency=frequency,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
@@ -37,7 +38,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[18, 8, 0]
+                device_ids=[9, 16, 0]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 

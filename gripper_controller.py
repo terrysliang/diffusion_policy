@@ -78,7 +78,7 @@ class GripperController(mp.Process):
         print(f"[GripperController] Exiting process.")
 
     def _set_closed_impl(self, closed):
-        pos = 150 if closed else 500
+        pos = 50 if closed else 500
         self.set_gripper_position(pos)
 
     def set_gripper_position(self, position_value):

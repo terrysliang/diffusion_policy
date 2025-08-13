@@ -157,7 +157,7 @@ class AuboInterpolationController(mp.Process):
 
     def run(self):
         import signal
-        signal.signal(signal.SIGINT, signal.SIG_IGN) # ignore ctrl-c
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         if self.soft_real_time:
             try:
@@ -166,10 +166,14 @@ class AuboInterpolationController(mp.Process):
                 print("Soft real time not enabled:", e)
 
         robot_ip = self.robot_ip
-        frequency = self.frequency
-        dt = 1.0 / frequency
+        # outer/planner rate (command polling / logging), can be 10, 30, 50, etc.
+        outer_hz = float(self.frequency)
+        outer_dt = 1.0 / outer_hz
 
-        # Connect RPC and RTDE clients
+        # fixed servo streaming period (Aubo ~125 Hz)
+        servo_dt = getattr(self, "servo_internal_dt", 1.0/100.0)
+
+        # --- connect & init (unchanged) ---
         rpc_client = pyaubo_sdk.RpcClient()
         rpc_client.setRequestTimeout(1000)
         ret = rpc_client.connect(robot_ip, 30004)
@@ -178,153 +182,151 @@ class AuboInterpolationController(mp.Process):
             rpc_client.login("aubo", "123456")
             if self.verbose:
                 print("[AuboInterpolationController] RPC client connected and logged in.")
-
         robot_name = rpc_client.getRobotNames()[0]
         robot_interface = rpc_client.getRobotInterface(robot_name)
         mc = robot_interface.getMotionControl()
 
-        # Set TCP offset if specified
-        # if self.tcp_offset_pose is not None:
-        #     robot_interface.getKinematics().setToolFrame(self.tcp_offset_pose.tolist())
-
-        # Init joints if specified
         if self.joints_init is not None:
             mc.moveJoint(self.joints_init.tolist(), self.joints_init_speed, self.joints_init_speed, 0., 0.)
             time.sleep(3.0)
 
-        # Enable servo mode
         mc.setServoMode(True)
         i = 0
         while not mc.isServoModeEnabled():
-            i = i + 1
+            i += 1
             if i > 5:
                 print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
                 return -1
             time.sleep(0.005)
 
+        # ---- build time-parameterized interpolator ----
+        tcp0_euler = robot_interface.getRobotState().getTcpPose()
+        curr_pose = np.array(tcp0_euler[:3] + R.from_euler('xyz', tcp0_euler[3:]).as_rotvec().tolist())
+        t0 = time.monotonic()
+        pose_interp = PoseTrajectoryInterpolator(times=[t0], poses=[curr_pose])
+
+        # helpers
+        def unwrap_euler(prev, cur):
+            if prev is None:
+                return cur
+            out = cur.copy()
+            for k in range(3):
+                d = out[k] - prev[k]
+                out[k] -= 2*np.pi * np.round(d / (2*np.pi))
+            return out
+
+        last_euler = None
+        keep_running = True
+        iter_idx = 0
+
+        # decouple: servo at 125 Hz, poll commands/log at outer_hz
+        next_outer_poll = t0 + outer_dt
+        next_state_log  = t0  # throttle state logging if you like
+
         try:
-            curr_pose_euler = robot_interface.getRobotState().getTcpPose()
-            curr_pose = np.array(curr_pose_euler[:3] + R.from_euler('xyz', curr_pose_euler[3:]).as_rotvec().tolist())
-
-            curr_t = time.monotonic()
-            last_waypoint_time = curr_t
-            pose_interp = PoseTrajectoryInterpolator(
-                times=[curr_t],
-                poses=[curr_pose]
-            )
-
-            iter_idx = 0
-            keep_running = True
             while keep_running:
-                t_start = time.perf_counter()
-                t_now = time.monotonic()
-                pose_command = pose_interp(t_now)
-                pose_euler = pose_command[:3].tolist() + R.from_rotvec(pose_command[3:]).as_euler('xyz').tolist()
+                tick_start = time.monotonic()
 
-                # Send servo command (cartesian)
-                # Aubo's API: servoCartesian(pose, vx, vy, period, acceleration, jerk)
+                # === (1) Evaluate trajectory at current time ===
+                pose_cmd = pose_interp(tick_start)  # rotvec orientation
+                curr_euler = R.from_rotvec(pose_cmd[3:]).as_euler('xyz')
+                pose_euler = np.concatenate([pose_cmd[:3], unwrap_euler(last_euler, curr_euler)])
+                last_euler = pose_euler[3:].copy()
 
+                # === (2) Stream one servo tick ===
                 if not mc.isServoModeEnabled():
                     mc.setServoMode(True)
-                    i = 0
+                    j = 0
                     while not mc.isServoModeEnabled():
-                        i = i + 1
-                        if i > 5:
-                            print("Failed to start servo mode, current state: ", mc.isServoModeEnabled())
+                        j += 1
+                        if j > 5:
+                            print("Failed to re-enable servo mode.")
                             return -1
                         time.sleep(0.005)
 
-                ret = mc.servoCartesian(pose_euler, 0, 0, dt, 0, 0)
-                
-                if ret != 0:
-                    print(f"[AuboInterpolationController] Return Value {ret}, sending pose command: {pose_command}, current pose: {curr_pose}")
+                ret = mc.servoCartesian(pose_euler.tolist(), 0, 0, servo_dt, 0, 0)
+                if ret != 0 and self.verbose:
+                    print(f"[servoCartesian] ret={ret}")
 
+                # === (3) Occasionally poll commands (10–50 Hz) and update interpolator ===
+                now = tick_start
+                if now >= next_outer_poll:
+                    # handle queued commands
+                    try:
+                        commands = self.input_queue.get_all()
+                        n_cmd = len(commands['cmd'])
+                    except Empty:
+                        n_cmd = 0
 
-                # Get state (fill keys as available)
-                state = dict()
-                tcp_pose = robot_interface.getRobotState().getTcpPose()
-                tcp_pose = np.array(tcp_pose)
-                actual_pose_rotvec = np.concatenate([
-                    tcp_pose[:3],
-                    R.from_euler('xyz', tcp_pose[3:]).as_rotvec()
-                ])
-                state['ActualTCPPose'] = actual_pose_rotvec
-                state['ActualTCPSpeed'] = np.array(robot_interface.getRobotState().getTcpSpeed())
-                state['ActualQ'] = np.array(robot_interface.getRobotState().getJointPositions())
-                state['ActualQd'] = np.array(robot_interface.getRobotState().getJointSpeeds())
-                state['TargetTCPPose'] = np.array(pose_command)
-                state['TargetTCPSpeed'] = np.zeros((6,))
-                state['TargetQ'] = np.zeros((6,))
-                state['TargetQd'] = np.zeros((6,))
-                state['robot_receive_timestamp'] = time.time()
-                self.ring_buffer.put(state)
+                    for k in range(n_cmd):
+                        command = {kk: vv[k] for kk, vv in commands.items()}
+                        cmd = command['cmd']
+                        if cmd == Command.STOP.value:
+                            keep_running = False
+                            break
+                        elif cmd == Command.SERVOL.value:
+                            target_pose = command['target_pose']
+                            duration = float(command['duration'])
+                            curr_time = now
+                            t_insert  = curr_time + duration
+                            pose_interp = pose_interp.drive_to_waypoint(
+                                pose=target_pose,
+                                time=t_insert,
+                                curr_time=curr_time,
+                                max_pos_speed=self.max_pos_speed,
+                                max_rot_speed=self.max_rot_speed
+                            )
+                        elif cmd == Command.SCHEDULE_WAYPOINT.value:
+                            target_pose = command['target_pose']
+                            target_time = float(command['target_time'])
+                            # convert wall time to monotonic
+                            target_time = time.monotonic() - time.time() + target_time
+                            curr_time = now
+                            pose_interp = pose_interp.schedule_waypoint(
+                                pose=target_pose,
+                                time=target_time,
+                                max_pos_speed=self.max_pos_speed,
+                                max_rot_speed=self.max_rot_speed,
+                                curr_time=curr_time,
+                                last_waypoint_time=None  # or track if you use it
+                            )
+                        else:
+                            keep_running = False
+                            break
 
-                # Handle commands
-                try:
-                    commands = self.input_queue.get_all()
-                    n_cmd = len(commands['cmd'])
-                except Empty:
-                    n_cmd = 0
+                    next_outer_poll = now + outer_dt
 
-                for i in range(n_cmd):
-                    command = {k: v[i] for k, v in commands.items()}
-                    cmd = command['cmd']
-                    if cmd == Command.STOP.value:
-                        keep_running = False
-                        break
-                    elif cmd == Command.SERVOL.value:
-                        target_pose = command['target_pose']
-                        duration = float(command['duration'])
-                        curr_time = t_now + dt
-                        t_insert = curr_time + duration
-                        pose_interp = pose_interp.drive_to_waypoint(
-                            pose=target_pose,
-                            time=t_insert,
-                            curr_time=curr_time,
-                            max_pos_speed=self.max_pos_speed,
-                            max_rot_speed=self.max_rot_speed
-                        )
-                        last_waypoint_time = t_insert
-                        if self.verbose:
-                            print("[AuboInterpolationController] New pose target:{} duration:{}s".format(
-                                target_pose, duration))
-                    elif cmd == Command.SCHEDULE_WAYPOINT.value:
-                        target_pose = command['target_pose']
-                        target_time = float(command['target_time'])
-                        target_time = time.monotonic() - time.time() + target_time
-                        curr_time = t_now + dt
-                        pose_interp = pose_interp.schedule_waypoint(
-                            pose=target_pose,
-                            time=target_time,
-                            max_pos_speed=self.max_pos_speed,
-                            max_rot_speed=self.max_rot_speed,
-                            curr_time=curr_time,
-                            last_waypoint_time=last_waypoint_time
-                        )
-                        last_waypoint_time = target_time
-                    else:
-                        keep_running = False
-                        break
+                    # (optional) log state at outer rate (or slower)
+                    state = dict()
+                    tcp_pose = np.array(robot_interface.getRobotState().getTcpPose())
+                    actual_pose_rotvec = np.concatenate([tcp_pose[:3], R.from_euler('xyz', tcp_pose[3:]).as_rotvec()])
+                    state['ActualTCPPose']   = actual_pose_rotvec
+                    state['ActualTCPSpeed']  = np.array(robot_interface.getRobotState().getTcpSpeed())
+                    state['ActualQ']         = np.array(robot_interface.getRobotState().getJointPositions())
+                    state['ActualQd']        = np.array(robot_interface.getRobotState().getJointSpeeds())
+                    state['TargetTCPPose']   = np.array(pose_cmd)
+                    state['TargetTCPSpeed']  = np.zeros((6,))
+                    state['TargetQ']         = np.zeros((6,))
+                    state['TargetQd']        = np.zeros((6,))
+                    state['robot_receive_timestamp'] = time.time()
+                    self.ring_buffer.put(state)
 
-                # Regulate frequency
-                t_elapsed = time.perf_counter() - t_start
-                t_sleep = max(0.0, dt - t_elapsed)
-                time.sleep(t_sleep)
+                # === (4) sleep to maintain servo period ===
+                elapsed = time.monotonic() - tick_start
+                time.sleep(max(0.0, servo_dt - elapsed))
 
                 if iter_idx == 0:
                     self.ready_event.set()
                 iter_idx += 1
-                if self.verbose:
-                    print(f"[AuboInterpolationController] Actual frequency {1/(time.perf_counter() - t_start)}")
 
         finally:
             mc.setServoMode(False)
             time.sleep(0.1)
             rpc_client.disconnect()
-            # rtde_client.disconnect()
             self.ready_event.set()
             if self.verbose:
                 print(f"[AuboInterpolationController] Disconnected from robot: {robot_ip}")
+
 
 if __name__ == '__main__':
     robot_ip = "192.168.100.77" 

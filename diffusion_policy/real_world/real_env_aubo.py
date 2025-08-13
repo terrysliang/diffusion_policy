@@ -145,7 +145,7 @@ class RealEnv:
         robot = AuboInterpolationController(
             shm_manager=shm_manager,
             robot_ip=robot_ip,
-            frequency=125,
+            frequency=10,
             max_pos_speed=max_pos_speed*cube_diag,
             max_rot_speed=max_rot_speed*cube_diag,
             launch_timeout=3,
