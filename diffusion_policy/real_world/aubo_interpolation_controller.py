@@ -155,6 +155,13 @@ class AuboInterpolationController(mp.Process):
     def get_all_state(self):
         return self.ring_buffer.get_all()
 
+
+    # Try min_seg_duration=0.10–0.15, max_seg_duration=0.25–0.35, catchup_margin=1.05–1.20.
+
+    # If rotation still “lags,” increase max_rot_speed toward max_pos_speed / L (tool length L in m). 
+    # E.g., with max_pos_speed=0.5 and L≈0.2, set max_rot_speed≈2.5 rad/s.
+
+    # If you prefer 125 Hz streaming, set servo_internal_dt=1/125.0; the rest stays the same.
     def run(self):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -166,12 +173,16 @@ class AuboInterpolationController(mp.Process):
                 print("Soft real time not enabled:", e)
 
         robot_ip = self.robot_ip
-        # outer/planner rate (command polling / logging), can be 10, 30, 50, etc.
         outer_hz = float(self.frequency)
         outer_dt = 1.0 / outer_hz
 
-        # fixed servo streaming period (Aubo ~125 Hz)
-        servo_dt = getattr(self, "servo_internal_dt", 1.0/100.0)
+        # fixed servo streaming period (Aubo ~100–125 Hz)
+        servo_dt = float(getattr(self, "servo_internal_dt", 1.0/100.0))
+
+        # knobs to trade off lag vs smoothness
+        min_seg_duration = float(getattr(self, "min_seg_duration", 0.12))  # ↓ this shortens lag
+        max_seg_duration = float(getattr(self, "max_seg_duration", 0.35))  # keep segments short
+        catchup_margin   = float(getattr(self, "catchup_margin", 1.10))    # 10% over min feasible
 
         # --- connect & init (unchanged) ---
         rpc_client = pyaubo_sdk.RpcClient()
@@ -205,6 +216,25 @@ class AuboInterpolationController(mp.Process):
         t0 = time.monotonic()
         pose_interp = PoseTrajectoryInterpolator(times=[t0], poses=[curr_pose])
 
+        # prepublish one state so env.is_ready becomes True quickly
+        try:
+            tcp_pose = np.array(robot_interface.getRobotState().getTcpPose())
+            actual_pose_rotvec = np.concatenate([tcp_pose[:3], R.from_euler('xyz', tcp_pose[3:]).as_rotvec()])
+            state0 = dict()
+            state0['ActualTCPPose']   = actual_pose_rotvec
+            state0['ActualTCPSpeed']  = np.array(robot_interface.getRobotState().getTcpSpeed())
+            state0['ActualQ']         = np.array(robot_interface.getRobotState().getJointPositions())
+            state0['ActualQd']        = np.array(robot_interface.getRobotState().getJointSpeeds())
+            state0['TargetTCPPose']   = np.array(curr_pose)
+            state0['TargetTCPSpeed']  = np.zeros((6,))
+            state0['TargetQ']         = np.zeros((6,))
+            state0['TargetQd']        = np.zeros((6,))
+            state0['robot_receive_timestamp'] = time.time()
+            self.ring_buffer.put(state0)
+            self.ready_event.set()
+        except Exception:
+            pass
+
         # helpers
         def unwrap_euler(prev, cur):
             if prev is None:
@@ -219,9 +249,12 @@ class AuboInterpolationController(mp.Process):
         keep_running = True
         iter_idx = 0
 
-        # decouple: servo at 125 Hz, poll commands/log at outer_hz
         next_outer_poll = t0 + outer_dt
-        next_state_log  = t0  # throttle state logging if you like
+        next_state_log  = t0
+
+        # throttle error prints
+        last_err_print_t = 0.0
+        err_print_interval = 0.5
 
         try:
             while keep_running:
@@ -246,28 +279,49 @@ class AuboInterpolationController(mp.Process):
 
                 ret = mc.servoCartesian(pose_euler.tolist(), 0, 0, servo_dt, 0, 0)
                 if ret != 0 and self.verbose:
-                    print(f"[servoCartesian] ret={ret}")
+                    nowp = time.monotonic()
+                    if (nowp - last_err_print_t) > err_print_interval:
+                        print(f"[servoCartesian] ret={ret}")
+                        last_err_print_t = nowp
 
                 # === (3) Occasionally poll commands (10–50 Hz) and update interpolator ===
                 now = tick_start
                 if now >= next_outer_poll:
-                    # handle queued commands
+                    # take ONLY the latest command to avoid backlog lag
                     try:
                         commands = self.input_queue.get_all()
                         n_cmd = len(commands['cmd'])
                     except Empty:
                         n_cmd = 0
 
-                    for k in range(n_cmd):
-                        command = {kk: vv[k] for kk, vv in commands.items()}
+                    if n_cmd > 0:
+                        command = {kk: vv[n_cmd-1] for kk, vv in commands.items()}
                         cmd = command['cmd']
+
                         if cmd == Command.STOP.value:
                             keep_running = False
-                            break
+
                         elif cmd == Command.SERVOL.value:
-                            target_pose = command['target_pose']
-                            duration = float(command['duration'])
+                            target_pose = command['target_pose']  # (6,) rotvec
+                            # -------- HARD RESET of the trajectory anchor --------
                             curr_time = now
+                            curr_pose_now = pose_interp(curr_time)
+                            pose_interp = PoseTrajectoryInterpolator(
+                                times=[curr_time],
+                                poses=[curr_pose_now]
+                            )
+                            # -------- AUTO-DURATION (short horizon) --------------
+                            dp = target_pose[:3] - curr_pose_now[:3]
+                            ang = np.linalg.norm(target_pose[3:] - curr_pose_now[3:])
+                            # conservative lower bound on time needed at your speed limits
+                            t_req_pos = np.linalg.norm(dp) / max(self.max_pos_speed, 1e-6)
+                            t_req_rot = ang / max(self.max_rot_speed, 1e-6)
+                            t_req = max(t_req_pos, t_req_rot)
+                            duration_cmd = float(command['duration'])
+                            # use the shortest reasonable horizon among: user cmd, required, max
+                            duration = min(duration_cmd, max_seg_duration)
+                            duration = max(duration, t_req * catchup_margin, min_seg_duration)
+
                             t_insert  = curr_time + duration
                             pose_interp = pose_interp.drive_to_waypoint(
                                 pose=target_pose,
@@ -276,23 +330,40 @@ class AuboInterpolationController(mp.Process):
                                 max_pos_speed=self.max_pos_speed,
                                 max_rot_speed=self.max_rot_speed
                             )
+
                         elif cmd == Command.SCHEDULE_WAYPOINT.value:
                             target_pose = command['target_pose']
                             target_time = float(command['target_time'])
-                            # convert wall time to monotonic
-                            target_time = time.monotonic() - time.time() + target_time
+                            # convert wall time to monotonic with fixed offset
+                            mono_offset = getattr(self, "_mono_offset_cached", None)
+                            if mono_offset is None:
+                                mono_offset = time.monotonic() - time.time()
+                                self._mono_offset_cached = mono_offset
+                            target_time = mono_offset + target_time
+                            # keep segments short
+                            if target_time - now < min_seg_duration:
+                                target_time = now + min_seg_duration
+                            if target_time - now > max_seg_duration:
+                                target_time = now + max_seg_duration
+
                             curr_time = now
+                            # hard reset before scheduling
+                            curr_pose_now = pose_interp(curr_time)
+                            pose_interp = PoseTrajectoryInterpolator(
+                                times=[curr_time],
+                                poses=[curr_pose_now]
+                            )
                             pose_interp = pose_interp.schedule_waypoint(
                                 pose=target_pose,
                                 time=target_time,
                                 max_pos_speed=self.max_pos_speed,
                                 max_rot_speed=self.max_rot_speed,
                                 curr_time=curr_time,
-                                last_waypoint_time=None  # or track if you use it
+                                last_waypoint_time=curr_time
                             )
+
                         else:
                             keep_running = False
-                            break
 
                     next_outer_poll = now + outer_dt
 
@@ -311,7 +382,7 @@ class AuboInterpolationController(mp.Process):
                     state['robot_receive_timestamp'] = time.time()
                     self.ring_buffer.put(state)
 
-                # === (4) sleep to maintain servo period ===
+                # === (4) regulate frequency ===
                 elapsed = time.monotonic() - tick_start
                 time.sleep(max(0.0, servo_dt - elapsed))
 

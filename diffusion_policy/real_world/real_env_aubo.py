@@ -39,7 +39,7 @@ class RealEnv:
             device_ids=None,
             obs_key_map=DEFAULT_OBS_KEY_MAP,
             obs_float32=False,
-            max_pos_speed=0.25,
+            max_pos_speed=0.15,
             max_rot_speed=0.16,
             tcp_offset=None,
             init_joints=False,
