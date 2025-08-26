@@ -54,19 +54,32 @@ from diffusion_policy.common.cv2_util import get_image_transform
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-LOCK_STATES = ["None", "Position", "Orientation"]
+LOCK_STATES = ["None", "Lock Rx+Ry", "Only Rz"]
 
-def _abs6_to_targets(action, template_pose):
-    """Map absolute 6D action(s) -> target pose array (T, len(template_pose))."""
+def lift_action_to_pose6(action: np.ndarray, template_pose: np.ndarray) -> np.ndarray:
+    """
+    Lift policy action to 6D target poses.
+    Supports:
+      - 2D:  [x, y]
+      - 4D:  [x, y, z, rz]     (rx, ry held from template)
+      - 6D:  [x, y, z, rx, ry, rz]
+    """
     a = np.atleast_2d(action)
-    if a.shape[1] not in (2, 6):
-        raise ValueError(f"Unsupported action dim {a.shape[1]}; expected 6 or 2.")
-    targets = np.zeros((a.shape[0], len(template_pose)), dtype=np.float64)
-    targets[:] = template_pose
-    if a.shape[1] == 6:
-        targets[:, :6] = a
-    else:  # 2-dim backward compatibility
+    targets = np.tile(template_pose, (a.shape[0], 1)).astype(np.float64)
+
+    adim = a.shape[1]
+    if   adim == 2:
         targets[:, [0, 1]] = a
+        # z, rx, ry, rz remain whatever template_pose has
+    elif adim == 4:
+        targets[:, [0, 1, 2, 5]] = a
+        # keep rx, ry from template (i.e., locked)
+        targets[:, 3] = template_pose[3]
+        targets[:, 4] = template_pose[4]
+    elif adim == 6:
+        targets[:, :6] = a
+    else:
+        raise ValueError(f"Unsupported action dim {adim}; expected 2, 4, or 6.")
     return targets
 
 def _clip_workspace(poses, env):
@@ -169,7 +182,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[8, 16, 0]
+                device_ids=[8, 16, 6]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 
@@ -197,7 +210,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             gripper_closed = False
             gripper.set_closed(gripper_closed)
             # inject gripper channel if used by model
-            obs['robot_gripper_qpos'] = np.array([float(gripper_closed)], dtype=np.float32)
+            # obs['robot_gripper_qpos'] = np.array([float(gripper_closed)], dtype=np.float32)
 
             with torch.no_grad():
                 policy.reset()
@@ -226,6 +239,8 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 t_sample = t_cycle_end - command_latency
                 t_command_target = t_cycle_end + dt
 
+                n_sched_this_iter = 1   # default for human mode
+
                 # --- key handling (works in both human/policy phases) ---
                 press_events = key_counter.get_press_events()
                 for key_stroke in press_events:
@@ -235,12 +250,22 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             env.end_episode()
                         stop = True
                     elif key_stroke == KeyCode(char='c') and not is_eval_running:
-                        # start evaluation
-                        start_time = t_start + (iter_idx + 2) * dt - time.monotonic() + time.time()
-                        env.start_episode(start_time)
+                        # Start evaluation with a clean timebase like the original DP script
+                        start_delay = 1.0
+                        eval_start_wall = time.time() + start_delay
+                        env.start_episode(eval_start_wall)
+
+                        # Reset the loop's monotonic anchor and iteration index
+                        t_start = time.monotonic() + start_delay
+                        iter_idx = 0
+
+                        # Optional: small wait to reduce camera latency (matches DP trick)
+                        precise_wait(eval_start_wall - 1.0/30.0, time_func=time.time)
+
                         key_counter.clear()
                         is_eval_running = True
                         print('Evaluation started.')
+
                     elif key_stroke == KeyCode(char='s') and is_eval_running:
                         # stop evaluation
                         env.end_episode()
@@ -272,7 +297,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
 
                 # --- pump obs; inject gripper channel if present in model ---
                 obs = env.get_obs()
-                obs['robot_gripper_qpos'] = np.array([float(gripper_closed)], dtype=np.float32)
+                # obs['robot_gripper_qpos'] = np.array([float(gripper_closed)], dtype=np.float32)
 
                 # --- visualization (overlay optional) ---
                 vis_img = obs[f'camera_{vis_camera_idx}'][-1, :, :, ::-1].copy()
@@ -311,10 +336,15 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                     dpos = sm_state[:3] * spacemouse_scale * (env.max_pos_speed / frequency)
                     drot_xyz = sm_state[3:] * spacemouse_scale * (env.max_rot_speed / frequency)
 
-                    if lock_state == 1:       # Position locked
-                        dpos[:] = 0
-                    elif lock_state == 2:     # Orientation locked
-                        drot_xyz[:] = 0
+                    if lock_state == 0:  # Nothing locked
+                        pass
+                    elif lock_state == 1:  # Lock rx and ry, leave rz + position free
+                        drot_xyz[0] = 0.0  # rx
+                        drot_xyz[1] = 0.0  # ry
+                    elif lock_state == 2:  # Only rz allowed; lock position + rx + ry
+                        dpos[:] = 0.0
+                        drot_xyz[0] = 0.0  # rx
+                        drot_xyz[1] = 0.0  # ry
 
                     target_pose[:3] += dpos
                     if not np.allclose(drot_xyz, 0):
@@ -333,50 +363,66 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 else:
                     # ==================== POLICY-IN-CONTROL ====================
                     try:
-                        # build obs_dict (with gripper channel if present)
                         with torch.no_grad():
                             s = time.time()
                             obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
                             obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             action = result['action'][0].detach().to('cpu').numpy()
-                            # expect absolute 6D poses
-                            this_target_poses = _abs6_to_targets(action, template_pose=target_pose)
-                            # workspace clipping (XY; optional Z)
+
+                            # Lift 2D/4D/6D -> 6D target poses (your helper)
+                            this_target_poses = lift_action_to_pose6(action, template_pose=target_pose)
+
+                            # Optional safety clamp
                             # this_target_poses = _clip_workspace(this_target_poses, env)
+
                             print('Inference latency:', time.time() - s)
 
-                        # schedule
+                        # Build timestamps for this burst
                         obs_timestamps = obs['timestamp']
                         action_timestamps = (np.arange(this_target_poses.shape[0], dtype=np.float64) + action_offset
                                             ) * dt + obs_timestamps[-1]
-                        action_exec_latency = 0.01
-                        curr_time = time.time()
-                        is_new = action_timestamps > (curr_time + action_exec_latency)
+
+                        # Keep a small execution cushion
+                        exec_cushion = 0.01
+                        now = time.time()
+                        is_new = action_timestamps > (now + exec_cushion)
 
                         if np.sum(is_new) == 0:
+                            # Over budget: schedule a single step slightly in the future
                             this_target_poses = this_target_poses[[-1]]
-                            next_step_idx = int(np.ceil((curr_time - (t_start + dt)) / dt))
-                            action_timestamps = np.array([t_start + next_step_idx * dt + (time.time() - time.monotonic())])
-                            print('Over budget', action_timestamps[0] - curr_time)
+                            action_timestamps = np.array([now + 2*dt])
+                            n_sched_this_iter = 1
+                            print('Over budget, scheduling 1 step at', action_timestamps[0] - now, 's ahead')
                         else:
                             this_target_poses = this_target_poses[is_new]
                             action_timestamps = action_timestamps[is_new]
+                            n_sched_this_iter = len(action_timestamps)
 
                         env.exec_actions(
                             actions=this_target_poses,
                             timestamps=action_timestamps,
-                            stages=[stage] * len(action_timestamps)
+                            stages=[stage] * n_sched_this_iter
                         )
-                        print(f"Submitted {len(this_target_poses)} step(s).")
+                        print(f"Submitted {n_sched_this_iter} step(s).")
+
+                        # Keep the template pose in sync for the next lift
+                        target_pose = this_target_poses[-1]
 
                     except KeyboardInterrupt:
                         print("Interrupted! Ending episode.")
                         env.end_episode()
                         is_eval_running = False
+                        n_sched_this_iter = 1
+
 
                 precise_wait(t_cycle_end)
-                iter_idx += 1
+                if is_eval_running:
+                    # Advance by the scheduled steps to keep t_cycle_end aligned
+                    iter_idx += max(1, n_sched_this_iter)
+                else:
+                    iter_idx += 1
+
 
     print("Done.")
 

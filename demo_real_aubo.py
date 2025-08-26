@@ -12,7 +12,7 @@ from diffusion_policy.real_world.keystroke_counter import (
     KeystrokeCounter, Key, KeyCode
 )
 
-LOCK_STATES = ["None", "Position", "Orientation"]
+LOCK_STATES = ["None", "Lock Rx+Ry", "Only Rz"]
 
 @click.command()
 @click.option('--output', '-o', required=True, help="Directory to save demonstration dataset.")
@@ -38,7 +38,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 thread_per_video=3,
                 video_crf=21,
                 shm_manager=shm_manager,
-                device_ids=[9, 16, 0]
+                device_ids=[8, 16, 6]
             ) as env, \
             GripperController("/dev/ttyUSB0") as gripper:
 
@@ -129,10 +129,13 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 drot_xyz = sm_state[3:] * spacemouse_scale * (env.max_rot_speed / frequency)
                 if lock_state == 0:  # Nothing locked
                     pass
-                elif lock_state == 1:  # Position locked
-                    dpos[:] = 0
-                elif lock_state == 2:  # Orientation locked
-                    drot_xyz[:] = 0
+                elif lock_state == 1:  # Lock rx and ry, leave rz + position free
+                    drot_xyz[0] = 0.0  # rx
+                    drot_xyz[1] = 0.0  # ry
+                elif lock_state == 2:  # Only rz allowed; lock position + rx + ry
+                    dpos[:] = 0.0
+                    drot_xyz[0] = 0.0  # rx
+                    drot_xyz[1] = 0.0  # ry
 
                 target_pose[:3] += dpos
 

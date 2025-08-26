@@ -16,10 +16,10 @@ shape_meta: &shape_meta
       shape: ${task.image_shape}
       type: rgb
     robot_eef_pose:
-      shape: [6]
+      shape: [4]
       type: low_dim
   action: 
-    shape: [6]
+    shape: [4]
 
 env_runner:
   _target_: diffusion_policy.env_runner.real_pipe_image_runner.RealPipeImageRunner

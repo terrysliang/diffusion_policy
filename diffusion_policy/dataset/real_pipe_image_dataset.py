@@ -259,16 +259,16 @@ def _get_replay_buffer(dataset_path, shape_meta, store):
         )
 
     # transform lowdim dimensions
-    if action_shape == (2,):
-        # 2D action space, only controls X and Y
+    if action_shape == (4,):
+        # 4D action space: [x, y, z, rz]
         zarr_arr = replay_buffer['action']
-        zarr_resize_index_last_dim(zarr_arr, idxs=[0,1])
+        zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
     
     for key, shape in lowdim_shapes.items():
-        if 'pose' in key and shape == (2,):
-            # only take X and Y
+        if 'pose' in key and shape == (4,):
+            # 4D pose: [x, y, z, rz]
             zarr_arr = replay_buffer[key]
-            zarr_resize_index_last_dim(zarr_arr, idxs=[0,1])
+            zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
 
     return replay_buffer
 
