@@ -7,9 +7,15 @@ import einops
 import numpy as np
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
+import torch.distributed as dist
+
 
 from torch.utils.data import random_split
 import wandb
+
+def is_main_process():
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
 
 
 def mlp(input_dim, hidden_dim, output_dim, hidden_depth, output_mod=None):
@@ -102,7 +108,8 @@ class TrainWithLogger:
         )
         if iterator is not None:
             iterator.set_postfix_str(postfix)
-        wandb.log(log_components, step=epoch)
+        if is_main_process():
+            wandb.log(log_components, step=epoch)
         self.log_components = OrderedDict()
 
 
