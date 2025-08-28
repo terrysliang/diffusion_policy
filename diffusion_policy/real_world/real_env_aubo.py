@@ -44,12 +44,12 @@ class RealEnv:
             tcp_offset=None,
             init_joints=False,
             video_capture_fps=30,
-            video_capture_resolution=(1280,720),
+            video_capture_resolution=(640,480),
             record_raw_video=True,
             thread_per_video=2,
             video_crf=21,
             enable_multi_cam_vis=True,
-            multi_cam_vis_resolution=(1280,720),
+            multi_cam_vis_resolution=(640,480),
             shm_manager=None
             ):
         assert frequency <= video_capture_fps

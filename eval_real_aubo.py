@@ -239,8 +239,6 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 t_sample = t_cycle_end - command_latency
                 t_command_target = t_cycle_end + dt
 
-                n_sched_this_iter = 1   # default for human mode
-
                 # --- key handling (works in both human/policy phases) ---
                 press_events = key_counter.get_press_events()
                 for key_stroke in press_events:
@@ -250,22 +248,12 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                             env.end_episode()
                         stop = True
                     elif key_stroke == KeyCode(char='c') and not is_eval_running:
-                        # Start evaluation with a clean timebase like the original DP script
-                        start_delay = 1.0
-                        eval_start_wall = time.time() + start_delay
-                        env.start_episode(eval_start_wall)
-
-                        # Reset the loop's monotonic anchor and iteration index
-                        t_start = time.monotonic() + start_delay
-                        iter_idx = 0
-
-                        # Optional: small wait to reduce camera latency (matches DP trick)
-                        precise_wait(eval_start_wall - 1.0/30.0, time_func=time.time)
-
+                        # start evaluation
+                        start_time = t_start + (iter_idx + 2) * dt - time.monotonic() + time.time()
+                        env.start_episode(start_time)
                         key_counter.clear()
                         is_eval_running = True
                         print('Evaluation started.')
-
                     elif key_stroke == KeyCode(char='s') and is_eval_running:
                         # stop evaluation
                         env.end_episode()
@@ -363,66 +351,50 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 else:
                     # ==================== POLICY-IN-CONTROL ====================
                     try:
+                        # build obs_dict (with gripper channel if present)
                         with torch.no_grad():
                             s = time.time()
                             obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
                             obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             action = result['action'][0].detach().to('cpu').numpy()
-
-                            # Lift 2D/4D/6D -> 6D target poses (your helper)
+                            # Lift 2D/4D/6D -> 6D target poses
                             this_target_poses = lift_action_to_pose6(action, template_pose=target_pose)
-
                             # Optional safety clamp
                             # this_target_poses = _clip_workspace(this_target_poses, env)
-
                             print('Inference latency:', time.time() - s)
 
-                        # Build timestamps for this burst
+                        # schedule
                         obs_timestamps = obs['timestamp']
                         action_timestamps = (np.arange(this_target_poses.shape[0], dtype=np.float64) + action_offset
                                             ) * dt + obs_timestamps[-1]
-
-                        # Keep a small execution cushion
-                        exec_cushion = 0.01
-                        now = time.time()
-                        is_new = action_timestamps > (now + exec_cushion)
+                        action_exec_latency = 0.01
+                        curr_time = time.time()
+                        is_new = action_timestamps > (curr_time + action_exec_latency)
 
                         if np.sum(is_new) == 0:
-                            # Over budget: schedule a single step slightly in the future
                             this_target_poses = this_target_poses[[-1]]
-                            action_timestamps = np.array([now + 2*dt])
-                            n_sched_this_iter = 1
-                            print('Over budget, scheduling 1 step at', action_timestamps[0] - now, 's ahead')
+                            next_step_idx = int(np.ceil((curr_time - (t_start + dt)) / dt))
+                            action_timestamps = np.array([t_start + next_step_idx * dt + (time.time() - time.monotonic())])
+                            print('Over budget', action_timestamps[0] - curr_time)
                         else:
                             this_target_poses = this_target_poses[is_new]
                             action_timestamps = action_timestamps[is_new]
-                            n_sched_this_iter = len(action_timestamps)
 
                         env.exec_actions(
                             actions=this_target_poses,
                             timestamps=action_timestamps,
-                            stages=[stage] * n_sched_this_iter
+                            stages=[stage] * len(action_timestamps)
                         )
-                        print(f"Submitted {n_sched_this_iter} step(s).")
-
-                        # Keep the template pose in sync for the next lift
-                        target_pose = this_target_poses[-1]
+                        print(f"Submitted {len(this_target_poses)} step(s).")
 
                     except KeyboardInterrupt:
                         print("Interrupted! Ending episode.")
                         env.end_episode()
                         is_eval_running = False
-                        n_sched_this_iter = 1
-
 
                 precise_wait(t_cycle_end)
-                if is_eval_running:
-                    # Advance by the scheduled steps to keep t_cycle_end aligned
-                    iter_idx += max(1, n_sched_this_iter)
-                else:
-                    iter_idx += 1
-
+                iter_idx += 1
 
     print("Done.")
 
