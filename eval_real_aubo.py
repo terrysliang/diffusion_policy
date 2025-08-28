@@ -56,6 +56,103 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 LOCK_STATES = ["None", "Lock Rx+Ry", "Only Rz"]
 
+# -------------------- helpers --------------------
+def _expected_obs_shapes(shape_meta, n_obs_steps):
+    exp = {}
+    for k, attr in shape_meta['obs'].items():
+        typ = attr.get('type', 'low_dim')
+        shape = tuple(attr['shape'])
+        if typ == 'rgb':
+            c, h, w = shape
+            exp[k] = ('rgb', (n_obs_steps, c, h, w))
+        else:
+            # low-dim: shape like (D,)
+            d = shape[0]
+            exp[k] = ('low', (n_obs_steps, d))
+    return exp
+
+def _ensure_T(x, T):
+    """Make sure leading time dim is T (pad by repeating last, or trim)."""
+    if x.ndim == 3:          # HWC or CHW -> add T
+        x = x[None, ...]
+    if x.shape[0] < T:
+        last = x[-1:]
+        x = np.concatenate([x] + [last] * (T - x.shape[0]), axis=0)
+    elif x.shape[0] > T:
+        x = x[-T:]
+    return x
+
+def _resize_frame_hw(frame_hw_c, H, W):
+    """Resize a single HWC frame to HxW."""
+    return cv2.resize(frame_hw_c, (W, H), interpolation=cv2.INTER_AREA)
+
+def coerce_obs_shapes(obs_dict_np: dict, shape_meta: dict, n_obs_steps: int) -> dict:
+    """
+    Make obs tensors match (T,C,H,W) for rgb and (T,D) for low-dim
+    as specified by shape_meta. Also converts *pose* keys to the
+    expected dimensionality (e.g., 6D -> 4D [x,y,z,rz]).
+    """
+    exp = _expected_obs_shapes(shape_meta, n_obs_steps)
+    out = {}
+    for k, (kind, exp_shape) in exp.items():
+        if k not in obs_dict_np:
+            continue
+        x = np.asarray(obs_dict_np[k])
+
+        if kind == 'rgb':
+            T, C, H, W = exp_shape
+            x = _ensure_T(x, T)
+
+            if x.ndim == 4 and x.shape[-1] == 3:     # THWC
+                if (x.shape[1], x.shape[2]) != (H, W):
+                    x = np.stack([_resize_frame_hw(f, H, W) for f in x], axis=0)
+                x = x.transpose(0, 3, 1, 2)           # THWC -> TCHW
+            elif x.ndim == 4 and x.shape[1] == 3:     # TCHW
+                if (x.shape[2], x.shape[3]) != (H, W):
+                    frames = []
+                    for f in x:                        # f: CHW
+                        f_hw_c = np.moveaxis(f, 0, -1)
+                        f_hw_c = _resize_frame_hw(f_hw_c, H, W)
+                        frames.append(np.moveaxis(f_hw_c, -1, 0))
+                    x = np.stack(frames, 0)
+            else:
+                raise ValueError(f"Unexpected rgb shape for key '{k}': {x.shape}")
+
+            if x.dtype == np.uint8:
+                x = x.astype(np.float32) / 255.0
+            else:
+                x = x.astype(np.float32)
+            out[k] = x
+
+        else:
+            # ----- low-dim -----
+            T, D = exp_shape
+            x = _ensure_T(x, T)
+
+            # unify to (T, Dim)
+            if x.ndim == 1:
+                x = x[None, ...]
+            if x.ndim > 2:
+                x = x.reshape(x.shape[0], -1)
+
+            # Special handling for pose keys
+            # If model expects 4D pose but runtime has 6D rotvec,
+            # keep [x,y,z,rz] -> indices [0,1,2,5].
+            if ('pose' in k) and (D == 4) and (x.shape[1] >= 6):
+                x = x[:, [0, 1, 2, 5]]
+
+            # If still wrong dim, last resort: trim or pad with last value
+            if x.shape[1] != D:
+                if x.shape[1] > D:
+                    x = x[:, :D]
+                else:
+                    pad = np.repeat(x[:, -1:], D - x.shape[1], axis=1)
+                    x = np.concatenate([x, pad], axis=1)
+
+            out[k] = x.astype(np.float32)
+
+    return out
+
 def lift_action_to_pose6(action: np.ndarray, template_pose: np.ndarray) -> np.ndarray:
     """
     Lift policy action to 6D target poses.
@@ -215,6 +312,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
             with torch.no_grad():
                 policy.reset()
                 obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
+                obs_dict_np = coerce_obs_shapes(obs_dict_np, cfg.task.shape_meta, n_obs_steps)
                 obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 result = policy.predict_action(obs_dict)
                 _warmup_action = result['action'][0].detach().to('cpu').numpy()
@@ -355,6 +453,7 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         with torch.no_grad():
                             s = time.time()
                             obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
+                            obs_dict_np = coerce_obs_shapes(obs_dict_np, cfg.task.shape_meta, n_obs_steps)
                             obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
                             action = result['action'][0].detach().to('cpu').numpy()
