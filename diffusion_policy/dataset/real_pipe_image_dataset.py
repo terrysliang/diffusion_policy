@@ -242,10 +242,10 @@ def _get_replay_buffer(dataset_path, shape_meta, store):
             lowdim_keys.append(key)
             lowdim_shapes[key] = tuple(shape)
             if 'pose' in key:
-                assert tuple(shape) in [(1,),(2,),(6,)]
+                assert tuple(shape) in [(1,),(2,),(4,),(6,)]
     
     action_shape = tuple(shape_meta['action']['shape'])
-    assert action_shape in [(2,),(6,),(7,)]
+    assert action_shape in [(2,),(4,),(6,),(7,)]
 
     # load data
     cv2.setNumThreads(1)
@@ -260,15 +260,24 @@ def _get_replay_buffer(dataset_path, shape_meta, store):
 
     # transform lowdim dimensions
     if action_shape == (4,):
-        # 4D action space: [x, y, z, rz]
         zarr_arr = replay_buffer['action']
-        zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
+        # if source has >=6 dims (e.g., [x,y,z,rx,ry,rz,...]), pick [0,1,2,5]
+        if zarr_arr.shape[-1] >= 6:
+            zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
+        elif zarr_arr.shape[-1] == 4:
+            pass
+        else:
+            raise ValueError(f"Cannot form 4D action from shape {zarr_arr.shape[-1]}.")
     
     for key, shape in lowdim_shapes.items():
         if 'pose' in key and shape == (4,):
-            # 4D pose: [x, y, z, rz]
             zarr_arr = replay_buffer[key]
-            zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
+            if zarr_arr.shape[-1] >= 6:
+                zarr_resize_index_last_dim(zarr_arr, idxs=[0,1,2,5])
+            elif zarr_arr.shape[-1] == 4:
+                pass
+            else:
+                raise ValueError(f"Cannot form 4D pose for {key} from shape {zarr_arr.shape[-1]}.")
 
     return replay_buffer
 
