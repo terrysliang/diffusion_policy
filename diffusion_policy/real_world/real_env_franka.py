@@ -44,8 +44,8 @@ class RealEnv:
             obs_key_map=DEFAULT_OBS_KEY_MAP,
             obs_float32=False,
             # action
-            max_pos_speed=0.15,
-            max_rot_speed=0.16,
+            max_pos_speed=0.05,
+            max_rot_speed=0.1,
             # robot
             tcp_offset=None,
             init_joints=False,

@@ -31,7 +31,7 @@ from diffusion_policy.real_world.keystroke_counter import (
 
 @click.command()
 @click.option('--output', '-o', required=True, help="Directory to save demonstration dataset.")
-@click.option('--robot_ip', '-ri', required=True, help="UR5's IP address e.g. 192.168.0.204")
+@click.option('--robot_ip', '-ri', required=True, help="Franka fr3's IP address e.g. 172.16.0.3")
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
 @click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")

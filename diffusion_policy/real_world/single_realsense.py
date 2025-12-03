@@ -284,18 +284,25 @@ class SingleRealsense(mp.Process):
         w, h = self.resolution
         fps = self.capture_fps
         align = rs.align(rs.stream.color)
+
         # Enable the streams from all the intel realsense devices
         rs_config = rs.config()
         if self.enable_color:
-            rs_config.enable_stream(rs.stream.color, 
-                w, h, rs.format.bgr8, fps)
+            rs_config.enable_stream(
+                rs.stream.color,
+                w, h, rs.format.bgr8, fps
+            )
         if self.enable_depth:
-            rs_config.enable_stream(rs.stream.depth, 
-                w, h, rs.format.z16, fps)
+            rs_config.enable_stream(
+                rs.stream.depth,
+                w, h, rs.format.z16, fps
+            )
         if self.enable_infrared:
-            rs_config.enable_stream(rs.stream.infrared,
-                w, h, rs.format.y8, fps)
-        
+            rs_config.enable_stream(
+                rs.stream.infrared,
+                w, h, rs.format.y8, fps
+            )
+
         try:
             rs_config.enable_device(self.serial_number)
 
@@ -303,31 +310,65 @@ class SingleRealsense(mp.Process):
             pipeline = rs.pipeline()
             pipeline_profile = pipeline.start(rs_config)
 
+            # cache device and sensors
+            device = pipeline_profile.get_device()
+
+            color_sensor = None
+            depth_sensor = None
+            try:
+                color_sensor = device.first_color_sensor()
+            except RuntimeError:
+                if self.verbose:
+                    print(f"[SingleRealsense {self.serial_number}] "
+                          "No dedicated color sensor found (likely D405).")
+            try:
+                depth_sensor = device.first_depth_sensor()
+            except RuntimeError:
+                if self.verbose:
+                    print(f"[SingleRealsense {self.serial_number}] "
+                          "No depth sensor found.")
+
             # report global time
             # https://github.com/IntelRealSense/librealsense/pull/3909
-            d = pipeline_profile.get_device().first_color_sensor()
-            d.set_option(rs.option.global_time_enabled, 1)
+            sensor_for_global_time = color_sensor if color_sensor is not None else depth_sensor
+            if sensor_for_global_time is not None:
+                try:
+                    sensor_for_global_time.set_option(
+                        rs.option.global_time_enabled, 1
+                    )
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[SingleRealsense {self.serial_number}] "
+                              f"Failed to enable global time: {e}")
+            else:
+                if self.verbose:
+                    print(f"[SingleRealsense {self.serial_number}] "
+                          "No sensor available to enable global time.")
 
             # setup advanced mode
             if self.advanced_mode_config is not None:
                 json_text = json.dumps(self.advanced_mode_config)
-                device = pipeline_profile.get_device()
                 advanced_mode = rs.rs400_advanced_mode(device)
                 advanced_mode.load_json(json_text)
 
-            # get
+            # get intrinsics from color stream
             color_stream = pipeline_profile.get_stream(rs.stream.color)
             intr = color_stream.as_video_stream_profile().get_intrinsics()
             order = ['fx', 'fy', 'ppx', 'ppy', 'height', 'width']
             for i, name in enumerate(order):
                 self.intrinsics_array.get()[i] = getattr(intr, name)
 
-            if self.enable_depth:
-                depth_sensor = pipeline_profile.get_device().first_depth_sensor()
+            # depth scale if available
+            if self.enable_depth and depth_sensor is not None:
                 depth_scale = depth_sensor.get_depth_scale()
                 self.intrinsics_array.get()[-1] = depth_scale
-            
-            # one-time setup (intrinsics etc, ignore for now)
+            elif self.enable_depth and depth_sensor is None:
+                if self.verbose:
+                    print(f"[SingleRealsense {self.serial_number}] "
+                          "Depth enabled but no depth sensor found; "
+                          "depth_scale left as 0.")
+
+            # main loop
             if self.verbose:
                 print(f'[SingleRealsense {self.serial_number}] Main loop started.')
 
@@ -356,40 +397,35 @@ class SingleRealsense(mp.Process):
                     data['color'] = np.asarray(color_frame.get_data())
                     t = color_frame.get_timestamp() / 1000
                     data['camera_capture_timestamp'] = t
-                    # print('device', time.time() - t)
-                    # print(color_frame.get_frame_timestamp_domain())
                 if self.enable_depth:
                     data['depth'] = np.asarray(
                         frameset.get_depth_frame().get_data())
                 if self.enable_infrared:
                     data['infrared'] = np.asarray(
                         frameset.get_infrared_frame().get_data())
-                
+
                 # apply transform
                 put_data = data
                 if self.transform is not None:
                     put_data = self.transform(dict(data))
 
-                if self.put_downsample:                
+                if self.put_downsample:
                     # put frequency regulation
-                    local_idxs, global_idxs, put_idx \
-                        = get_accumulate_timestamp_idxs(
-                            timestamps=[receive_time],
-                            start_time=put_start_time,
-                            dt=1/self.put_fps,
-                            # this is non in first iteration
-                            # and then replaced with a concrete number
-                            next_global_idx=put_idx,
-                            # continue to pump frames even if not started.
-                            # start_time is simply used to align timestamps.
-                            allow_negative=True
-                        )
+                    local_idxs, global_idxs, put_idx = get_accumulate_timestamp_idxs(
+                        timestamps=[receive_time],
+                        start_time=put_start_time,
+                        dt=1 / self.put_fps,
+                        # this is none in first iteration
+                        # and then replaced with a concrete number
+                        next_global_idx=put_idx,
+                        # continue to pump frames even if not started.
+                        # start_time is simply used to align timestamps.
+                        allow_negative=True
+                    )
 
                     for step_idx in global_idxs:
                         put_data['step_idx'] = step_idx
-                        # put_data['timestamp'] = put_start_time + step_idx / self.put_fps
                         put_data['timestamp'] = receive_time
-                        # print(step_idx, data['timestamp'])
                         self.ring_buffer.put(put_data, wait=False)
                 else:
                     step_idx = int((receive_time - put_start_time) * self.put_fps)
@@ -400,7 +436,7 @@ class SingleRealsense(mp.Process):
                 # signal ready
                 if iter_idx == 0:
                     self.ready_event.set()
-                
+
                 # put to vis
                 vis_data = data
                 if self.vis_transform == self.transform:
@@ -408,7 +444,7 @@ class SingleRealsense(mp.Process):
                 elif self.vis_transform is not None:
                     vis_data = self.vis_transform(dict(data))
                 self.vis_ring_buffer.put(vis_data, wait=False)
-                
+
                 # record frame
                 rec_data = data
                 if self.recording_transform == self.transform:
@@ -416,17 +452,20 @@ class SingleRealsense(mp.Process):
                 elif self.recording_transform is not None:
                     rec_data = self.recording_transform(dict(data))
 
-                if self.video_recorder.is_ready():
-                    self.video_recorder.write_frame(rec_data['color'], 
-                        frame_time=receive_time)
+                if self.video_recorder.is_ready() and self.enable_color:
+                    self.video_recorder.write_frame(
+                        rec_data['color'],
+                        frame_time=receive_time
+                    )
 
                 # perf
                 t_end = time.time()
                 duration = t_end - t_start
-                frequency = np.round(1 / duration, 1)
+                if duration > 0:
+                    frequency = np.round(1 / duration, 1)
+                    if self.verbose:
+                        print(f'[SingleRealsense {self.serial_number}] FPS {frequency}')
                 t_start = t_end
-                if self.verbose:
-                    print(f'[SingleRealsense {self.serial_number}] FPS {frequency}')
 
                 # fetch command from queue
                 try:
@@ -437,44 +476,78 @@ class SingleRealsense(mp.Process):
 
                 # execute commands
                 for i in range(n_cmd):
-                    command = dict()
-                    for key, value in commands.items():
-                        command[key] = value[i]
+                    command = {key: value[i] for key, value in commands.items()}
                     cmd = command['cmd']
+
                     if cmd == Command.SET_COLOR_OPTION.value:
-                        sensor = pipeline_profile.get_device().first_color_sensor()
-                        option = rs.option(command['option_enum'])
-                        value = float(command['option_value'])
-                        sensor.set_option(option, value)
-                        # print('auto', sensor.get_option(rs.option.enable_auto_exposure))
-                        # print('exposure', sensor.get_option(rs.option.exposure))
-                        # print('gain', sensor.get_option(rs.option.gain))
+                        # Prefer color sensor; fall back to depth (e.g. D405)
+                        sensor = color_sensor if color_sensor is not None else depth_sensor
+                        if sensor is None:
+                            if self.verbose:
+                                print(f"[SingleRealsense {self.serial_number}] "
+                                      "No sensor available to set color option.")
+                        else:
+                            option = rs.option(command['option_enum'])
+                            value = float(command['option_value'])
+                            try:
+                                sensor.set_option(option, value)
+                            except Exception as e:
+                                if self.verbose:
+                                    print(f"[SingleRealsense {self.serial_number}] "
+                                          f"Failed to set color option {option}: {e}")
+
                     elif cmd == Command.SET_DEPTH_OPTION.value:
-                        sensor = pipeline_profile.get_device().first_depth_sensor()
-                        option = rs.option(command['option_enum'])
-                        value = float(command['option_value'])
-                        sensor.set_option(option, value)
+                        sensor = depth_sensor
+                        if sensor is None:
+                            if self.verbose:
+                                print(f"[SingleRealsense {self.serial_number}] "
+                                      "No depth sensor available to set depth option.")
+                        else:
+                            option = rs.option(command['option_enum'])
+                            value = float(command['option_value'])
+                            try:
+                                sensor.set_option(option, value)
+                            except Exception as e:
+                                if self.verbose:
+                                    print(f"[SingleRealsense {self.serial_number}] "
+                                          f"Failed to set depth option {option}: {e}")
+
                     elif cmd == Command.START_RECORDING.value:
                         video_path = str(command['video_path'])
                         start_time = command['recording_start_time']
                         if start_time < 0:
                             start_time = None
-                        self.video_recorder.start(video_path, start_time=start_time)
+                        self.video_recorder.start(
+                            video_path,
+                            start_time=start_time
+                        )
+
                     elif cmd == Command.STOP_RECORDING.value:
                         self.video_recorder.stop()
                         # stop need to flush all in-flight frames to disk, which might take longer than dt.
                         # soft-reset put to drop frames to prevent ring buffer overflow.
                         put_idx = None
+
                     elif cmd == Command.RESTART_PUT.value:
                         put_idx = None
                         put_start_time = command['put_start_time']
-                        # self.ring_buffer.clear()
 
                 iter_idx += 1
+
         finally:
-            self.video_recorder.stop()
-            rs_config.disable_all_streams()
+            # Stop recording gracefully
+            try:
+                self.video_recorder.stop()
+            except Exception:
+                pass
+
+            # Stop the RealSense pipeline if it was started
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
             self.ready_event.set()
-        
+
         if self.verbose:
             print(f'[SingleRealsense {self.serial_number}] Exiting worker process.')
