@@ -67,16 +67,16 @@ class FrankaInterpolationController(mp.Process):
         self,
         shm_manager: SharedMemoryManager,
         robot_ip,
-        frequency=1000,           # Franka control loop is 1 kHz
-        max_pos_speed=0.05,
-        max_rot_speed=0.3,
-        max_pos_acc=0.5,          # m/s^2, conservative
-        max_rot_acc=1.0,          # rad/s^2, conservative
+        frequency=100,
+        max_pos_speed=0.01,       # [m/s]
+        max_rot_speed=0.05,        # [rad/s]
+        max_pos_acc=0.05,          # [m/s^2]   <- NEW
+        max_rot_acc=0.2,          # [rad/s^2] <- NEW
         launch_timeout=3.0,
-        tcp_offset_pose=None,     # ignored or used with set_EE / set_load if you want
-        payload_mass=None,        # can be wired into robot.set_load()
+        tcp_offset_pose=None,
+        payload_mass=None,
         payload_cog=None,
-        joints_init=None,         # can be used to move to a start joint config via a separate script
+        joints_init=None,
         soft_real_time=False,
         verbose=False,
         receive_keys=None,
@@ -93,6 +93,9 @@ class FrankaInterpolationController(mp.Process):
         assert frequency > 0
         assert 0 < max_pos_speed
         assert 0 < max_rot_speed
+        assert 0 < max_pos_acc
+        assert 0 < max_rot_acc
+
         if tcp_offset_pose is not None:
             tcp_offset_pose = np.array(tcp_offset_pose, dtype=float)
             assert tcp_offset_pose.shape == (6,)
@@ -117,6 +120,8 @@ class FrankaInterpolationController(mp.Process):
         self.joints_init = joints_init
         self.soft_real_time = soft_real_time
         self.verbose = verbose
+        self.Kp_pos = 4.0
+        self.Kp_rot = 4.0
 
         # ===== build input queue =====
         example = {
@@ -283,191 +288,221 @@ class FrankaInterpolationController(mp.Process):
                     print("Soft real time not enabled:", e)
 
         robot_ip = self.robot_ip
-        outer_hz = float(self.frequency)   # state logging / DP polling rate
+        outer_hz = float(self.frequency)   # for queue polling + logging only
         outer_dt = 1.0 / outer_hz
 
-        # --- connect robot and start cartesian pose control (like official example) ---
+        # --- connect Franka (no external control yet) ---
         robot = Robot(robot_ip)
 
-        # Start Cartesian pose control
-        active_control = robot.start_cartesian_pose_control(ControllerMode.JointImpedance)
+        # --- start external cartesian pose control ---
+        active_control = robot.start_cartesian_pose_control(
+            ControllerMode.JointImpedance
+        )
 
-        # First state under active control
+        # FIRST state inside pose-control mode, like official example
         robot_state, duration = active_control.readOnce()
-        dt = self.duration_to_sec(duration)
-        if dt <= 0.0:
-            dt = 1.0 / 1000.0
+        t0 = time.monotonic()
 
-        # Initial commanded pose = current pose
-        O_T_EE = np.array(robot_state.O_T_EE, dtype=float)
-        T_cmd = O_T_EE.reshape(4, 4, order='F')   # column-major → 4x4
-        R_cmd = T_cmd[:3, :3].copy()
-        p_cmd = T_cmd[:3, 3].copy()
+        # Initial 6D pose
+        curr_pose6d = o_t_ee_to_6d(robot_state.O_T_EE)
 
-        # Target pose (6D) starts as current pose
-        pose_ref = o_t_ee_to_6d(robot_state.O_T_EE)  # [x,y,z,rx,ry,rz]
+        # Internal command state
+        cmd_pose  = curr_pose6d.copy()            # what we command
+        cmd_vel   = np.zeros(6, dtype=float)      # [vx,vy,vz,wx,wy,wz]
+        goal_pose = curr_pose6d.copy()            # latest requested target
+        goal_arrival_time = t0                    # “already at goal”
 
-        # Velocities to be kept continuous
-        v_curr = np.zeros(3)   # linear velocity [m/s]
-        w_curr = np.zeros(3)   # angular velocity [rad/s]
-
-        # Publish initial state to ring buffer
+        # Prepublish one state so env.is_ready becomes True quickly
         state0 = dict()
-        state0['ActualTCPPose']   = pose_ref.copy()
+        state0['ActualTCPPose']   = curr_pose6d.copy()
         state0['ActualQ']         = np.array(robot_state.q, dtype=float)
         state0['ActualQd']        = np.array(robot_state.dq, dtype=float)
-        state0['TargetTCPPose']   = pose_ref.copy()
-        state0['TargetTCPSpeed']  = np.zeros((6,))
-        state0['TargetQ']         = np.zeros((7,))
-        state0['TargetQd']        = np.zeros((7,))
+        state0['TargetTCPPose']   = cmd_pose.copy()
+        state0['TargetTCPSpeed']  = cmd_vel.copy()
+        state0['TargetQ']         = np.zeros((7,), dtype=float)
+        state0['TargetQd']        = np.zeros((7,), dtype=float)
         state0['robot_receive_timestamp'] = time.time()
         self.ring_buffer.put(state0)
         self.ready_event.set()
 
+        next_outer_poll = t0 + outer_dt
         keep_running = True
         iter_idx = 0
-        next_outer_poll = time.monotonic() + outer_dt
-        last_state_log = time.monotonic()
 
-        # Simple time constants for "servo-like" behavior
-        # Smaller → more aggressive (but closer to accel limits)
-        tau_pos = 0.2   # seconds
-        tau_rot = 0.2
+        # Local copies of limits
+        max_pos_speed = float(self.max_pos_speed)
+        max_rot_speed = float(self.max_rot_speed)
+        max_pos_acc   = float(self.max_pos_acc)
+        max_rot_acc   = float(self.max_rot_acc)
+
+        # for schedule_waypoint wall→mono
+        mono_offset = None
+        last_time = t0
 
         if self.verbose:
-            print(f"[FrankaInterpolationController] Started control loop on {robot_ip}")
+            print("[FrankaInterpolationController] External cartesian pose control started.")
+            print(f"Initial pose6d: {curr_pose6d}")
 
         try:
             while keep_running:
-                # (1) FCI tick: read state and get true dt
+                # === (1) FCI tick: read state, get dt ===
                 robot_state, duration = active_control.readOnce()
-                dt = self.duration_to_sec(duration)
-                if dt <= 0.0:
-                    dt = 1.0 / 1000.0
                 now = time.monotonic()
+                dt = duration.to_sec()
+                if dt <= 0.0:
+                    dt = max(now - last_time, 1e-4)
+                last_time = now
 
-                # (2) Poll latest command (if any)
-                try:
-                    commands = self.input_queue.get_all()
-                    n_cmd = len(commands['cmd'])
-                except Empty:
-                    n_cmd = 0
-
-                if n_cmd > 0:
-                    # Only keep the latest command
-                    command = {k: v[n_cmd - 1] for k, v in commands.items()}
-                    cmd = command['cmd']
-
-                    if cmd == Command.STOP.value:
-                        keep_running = False
-
-                    elif cmd == Command.SERVOL.value:
-                        # New target 6D pose; we treat it as a setpoint for a velocity PD
-                        target_pose = np.array(command['target_pose'], dtype=float)
-                        assert target_pose.shape == (6,)
-                        pose_ref = target_pose  # update setpoint
-                        # duration is available as command['duration'] if you want
-                        # to adapt tau_pos / tau_rot based on it.
-
-                    elif cmd == Command.SCHEDULE_WAYPOINT.value:
-                        # Treat same as SERVOL for now: new setpoint
-                        target_pose = np.array(command['target_pose'], dtype=float)
-                        assert target_pose.shape == (6,)
-                        pose_ref = target_pose
-
-                    else:
-                        keep_running = False
-
-                # (3) Pose error between current commanded pose and reference pose
-                #     Build T_ref from pose_ref
-                T_ref = pose6d_to_matrix(pose_ref)
-                p_ref = T_ref[:3, 3]
-                R_ref = T_ref[:3, :3]
-
-                # position error
-                e_p = p_ref - p_cmd
-
-                # orientation error on SO(3): R_err = R_ref * R_cmd^T, convert to rotvec
-                R_err = R_ref @ R_cmd.T
-                rot_err = st.Rotation.from_matrix(R_err).as_rotvec()
-
-                # (4) Desired velocities from a simple first-order "servo"
-                #     v_des ≈ e / tau, limited by max speed
-                v_des = e_p / max(tau_pos, 1e-3)
-                w_des = rot_err / max(tau_rot, 1e-3)
-
-                # limit speeds
-                v_norm = np.linalg.norm(v_des)
-                if v_norm > self.max_pos_speed:
-                    v_des *= self.max_pos_speed / max(v_norm, 1e-9)
-
-                w_norm = np.linalg.norm(w_des)
-                if w_norm > self.max_rot_speed:
-                    w_des *= self.max_rot_speed / max(w_norm, 1e-9)
-
-                # (5) Acceleration limiting: keep v_curr/w_curr continuous
-                #     dv / dt <= max_pos_acc, dw / dt <= max_rot_acc
-                # linear
-                dv = v_des - v_curr
-                dv_norm = np.linalg.norm(dv)
-                dv_max = self.max_pos_acc * dt
-                if dv_norm > dv_max:
-                    v_curr += dv * (dv_max / max(dv_norm, 1e-9))
-                else:
-                    v_curr = v_des
-
-                # angular
-                dw = w_des - w_curr
-                dw_norm = np.linalg.norm(dw)
-                dw_max = self.max_rot_acc * dt
-                if dw_norm > dw_max:
-                    w_curr += dw * (dw_max / max(dw_norm, 1e-9))
-                else:
-                    w_curr = w_des
-
-                # (6) Integrate commanded pose in SE(3)
-                p_cmd = p_cmd + v_curr * dt
-                if np.linalg.norm(w_curr) > 1e-9:
-                    dR = st.Rotation.from_rotvec(w_curr * dt).as_matrix()
-                    R_cmd = dR @ R_cmd
-
-                T_cmd[:3, 3] = p_cmd
-                T_cmd[:3, :3] = R_cmd
-
-                # (7) Send command to robot (column-major 4x4 like example)
-                cmd_pose = CartesianPose(T_cmd.reshape(-1, order='F').tolist())
-                active_control.writeOnce(cmd_pose)
-
-                # (8) Log state to ring buffer at outer_hz
+                # === (2) Outer-rate work: commands & state logging ===
                 if now >= next_outer_poll:
-                    target_rotvec = st.Rotation.from_matrix(R_cmd).as_rotvec()
-                    target_pose6d = np.concatenate([p_cmd, target_rotvec])
-                    target_twist = np.concatenate([v_curr, w_curr])
+                    # ---- poll commands (take latest only) ----
+                    try:
+                        commands = self.input_queue.get_all()
+                        n_cmd = len(commands['cmd'])
+                    except Empty:
+                        n_cmd = 0
 
-                    state = dict()
-                    state['ActualTCPPose']   = o_t_ee_to_6d(robot_state.O_T_EE)
-                    state['ActualQ']         = np.array(robot_state.q, dtype=float)
-                    state['ActualQd']        = np.array(robot_state.dq, dtype=float)
-                    state['TargetTCPPose']   = target_pose6d
-                    state['TargetTCPSpeed']  = target_twist
-                    state['TargetQ']         = np.zeros((7,))
-                    state['TargetQd']        = np.zeros((7,))
-                    state['robot_receive_timestamp'] = time.time()
-                    self.ring_buffer.put(state)
+                    if n_cmd > 0:
+                        command = {k: v[n_cmd - 1] for k, v in commands.items()}
+                        cmd_type = command['cmd']
+
+                        if cmd_type == Command.STOP.value:
+                            keep_running = False
+
+                        elif cmd_type == Command.SERVOL.value:
+                            target_pose = np.array(command['target_pose'], dtype=float)
+                            duration_cmd = float(command['duration'])
+                            if duration_cmd <= 0.0:
+                                duration_cmd = outer_dt
+                            goal_pose = target_pose
+                            goal_arrival_time = now + duration_cmd
+
+                            if self.verbose:
+                                print("[FrankaInterpolationController] SERVOL to",
+                                      target_pose, "over", duration_cmd, "s")
+
+                        elif cmd_type == Command.SCHEDULE_WAYPOINT.value:
+                            target_pose = np.array(command['target_pose'], dtype=float)
+                            target_time_wall = float(command['target_time'])
+                            if mono_offset is None:
+                                mono_offset = time.monotonic() - time.time()
+                            target_time_mono = mono_offset + target_time_wall
+
+                            duration_cmd = max(target_time_mono - now, outer_dt)
+                            goal_pose = target_pose
+                            goal_arrival_time = now + duration_cmd
+
+                            if self.verbose:
+                                print("[FrankaInterpolationController] SCHEDULE_WAYPOINT to",
+                                      target_pose, "arrive in", duration_cmd, "s")
+
+                        else:
+                            keep_running = False
+
+                    # ---- log state at outer rate ----
+                    log_state = dict()
+                    log_state['ActualTCPPose'] = o_t_ee_to_6d(robot_state.O_T_EE)
+                    log_state['ActualQ']       = np.array(robot_state.q, dtype=float)
+                    log_state['ActualQd']      = np.array(robot_state.dq, dtype=float)
+                    log_state['TargetTCPPose'] = cmd_pose.copy()
+                    log_state['TargetTCPSpeed'] = cmd_vel.copy()
+                    log_state['TargetQ']       = np.zeros((7,), dtype=float)
+                    log_state['TargetQd']      = np.zeros((7,), dtype=float)
+                    log_state['robot_receive_timestamp'] = time.time()
+                    self.ring_buffer.put(log_state)
 
                     next_outer_poll = now + outer_dt
+
+                # === (3) Velocity / acceleration limited servo towards goal_pose ===
+
+                # Position error
+                pos_err = goal_pose[:3] - cmd_pose[:3]
+
+                # Orientation error via relative rotation:
+                R_cmd = st.Rotation.from_rotvec(cmd_pose[3:])
+                R_goal = st.Rotation.from_rotvec(goal_pose[3:])
+                R_err = R_goal * R_cmd.inv()
+                rot_err = R_err.as_rotvec()      # “shortest” rotation from cmd→goal
+
+                # If we have time_to_goal>0, aim to arrive in that time.
+                time_to_goal = goal_arrival_time - now
+                if time_to_goal <= 0.0:
+                    vel_des = np.zeros(6, dtype=float)
+                else:
+                    v_pos_des = pos_err / time_to_goal
+                    v_rot_des = rot_err / time_to_goal
+                    vel_des = np.concatenate([v_pos_des, v_rot_des])
+
+                # --- clamp velocity ---
+                v_pos_des = vel_des[:3]
+                v_rot_des = vel_des[3:]
+
+                pos_speed = np.linalg.norm(v_pos_des)
+                if pos_speed > max_pos_speed > 0.0:
+                    v_pos_des *= (max_pos_speed / pos_speed)
+
+                rot_speed = np.linalg.norm(v_rot_des)
+                if rot_speed > max_rot_speed > 0.0:
+                    v_rot_des *= (max_rot_speed / rot_speed)
+
+                vel_des[:3] = v_pos_des
+                vel_des[3:] = v_rot_des
+
+                # --- acceleration limiting (change from cmd_vel → vel_des) ---
+                dv = vel_des - cmd_vel
+
+                dv_pos = dv[:3]
+                dv_rot = dv[3:]
+
+                max_dv_pos = max_pos_acc * dt
+                if max_dv_pos > 0.0:
+                    dv_pos_norm = np.linalg.norm(dv_pos)
+                    if dv_pos_norm > max_dv_pos:
+                        dv_pos *= (max_dv_pos / dv_pos_norm)
+
+                max_dv_rot = max_rot_acc * dt
+                if max_dv_rot > 0.0:
+                    dv_rot_norm = np.linalg.norm(dv_rot)
+                    if dv_rot_norm > max_dv_rot:
+                        dv_rot *= (max_dv_rot / dv_rot_norm)
+
+                cmd_vel[:3] += dv_pos
+                cmd_vel[3:] += dv_rot
+
+                # --- integrate pose command ---
+                # position:
+                cmd_pose[:3] += cmd_vel[:3] * dt
+
+                # orientation via incremental rotation
+                w_inc = cmd_vel[3:] * dt
+                w_norm = np.linalg.norm(w_inc)
+                if w_norm > 1e-9:
+                    R_inc = st.Rotation.from_rotvec(w_inc)
+                    R_new = R_inc * R_cmd
+                    cmd_pose[3:] = R_new.as_rotvec()
+
+                # === (4) Send command for this control cycle ===
+                T_cmd = pose6d_to_matrix(cmd_pose)
+                cartesian_pose = CartesianPose(T_cmd.reshape(-1, order='F').tolist())
+                active_control.writeOnce(cartesian_pose)
+
+                if self.verbose and (iter_idx % 500 == 0):
+                    print(f"[FrankaInterpolationController] dt={dt:.6f}, "
+                          f"|v_pos|={np.linalg.norm(cmd_vel[:3]):.4f}, "
+                          f"|v_rot|={np.linalg.norm(cmd_vel[3:]):.4f}")
 
                 if iter_idx == 0:
                     self.ready_event.set()
                 iter_idx += 1
 
         finally:
-            # graceful stop like official example
+            # graceful stop
             try:
-                # send final pose with motion_finished=True
-                cmd_pose = CartesianPose(T_cmd.reshape(-1, order='F').tolist())
-                cmd_pose.motion_finished = True
-                active_control.writeOnce(cmd_pose)
+                pose6d = o_t_ee_to_6d(robot_state.O_T_EE)
+                T_final = pose6d_to_matrix(pose6d)
+                cmd = CartesianPose(T_final.reshape(-1, order='F').tolist())
+                cmd.motion_finished = True
+                active_control.writeOnce(cmd)
             except Exception:
                 pass
             try:
