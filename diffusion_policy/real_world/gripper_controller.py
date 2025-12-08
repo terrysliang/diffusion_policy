@@ -91,7 +91,7 @@ class GripperController:
         return True
 
     def set_closed(self, closed=True):
-        pos = 50 if closed else 500
+        pos = 0 if closed else 500
         return self.set_gripper_position(pos)
 
     def open(self):

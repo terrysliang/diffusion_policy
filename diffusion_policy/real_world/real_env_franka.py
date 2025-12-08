@@ -44,8 +44,8 @@ class RealEnv:
             obs_key_map=DEFAULT_OBS_KEY_MAP,
             obs_float32=False,
             # action
-            max_pos_speed=0.05,
-            max_rot_speed=0.1,
+            max_pos_speed=0.10,       # [m/s]
+            max_rot_speed=0.20,        # [rad/s]
             # robot
             tcp_offset=None,
             init_joints=False,
@@ -324,9 +324,9 @@ class RealEnv:
 
         # schedule waypoints
         for i in range(len(new_actions)):
-            self.robot.schedule_waypoint(
+            self.robot.servoL(
                 pose=new_actions[i],
-                target_time=new_timestamps[i]
+                duration=0.1
             )
         
         # record actions

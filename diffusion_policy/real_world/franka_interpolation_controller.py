@@ -67,8 +67,8 @@ class FrankaInterpolationController(mp.Process):
         frequency=100,
         max_pos_speed=0.01,       # [m/s]
         max_rot_speed=0.05,        # [rad/s]
-        max_pos_acc=0.05,          # [m/s^2]   <- NEW
-        max_rot_acc=0.2,          # [rad/s^2] <- NEW
+        max_pos_acc=0.05,          # [m/s^2]
+        max_rot_acc=0.10,          # [rad/s^2]
         launch_timeout=3.0,
         tcp_offset_pose=None,
         payload_mass=None,
@@ -309,6 +309,12 @@ class FrankaInterpolationController(mp.Process):
         goal_pose = curr_pose6d.copy()            # latest requested target
         goal_arrival_time = t0                    # “already at goal”
 
+        # === new: state for de-bouncing duplicate commands / idle stop ===
+        last_goal_pose = goal_pose.copy()
+        last_cmd_time = t0
+        pose_eps = 1e-4      # [m/rad] threshold for "new" command
+        idle_timeout = 0.3   # [s] after no new command, lock & stop near goal
+
         # Prepublish one state so env.is_ready becomes True quickly
         state0 = dict()
         state0['ActualTCPPose']   = curr_pose6d.copy()
@@ -345,7 +351,7 @@ class FrankaInterpolationController(mp.Process):
                 # === (1) FCI tick: read state, get dt ===
                 robot_state, duration = active_control.readOnce()
                 now = time.monotonic()
-                dt = duration.to_sec()
+                dt = self.duration_to_sec(duration)
                 if dt <= 0.0:
                     dt = max(now - last_time, 1e-4)
                 last_time = now
@@ -371,12 +377,18 @@ class FrankaInterpolationController(mp.Process):
                             duration_cmd = float(command['duration'])
                             if duration_cmd <= 0.0:
                                 duration_cmd = outer_dt
-                            goal_pose = target_pose
-                            goal_arrival_time = now + duration_cmd
 
-                            if self.verbose:
-                                print("[FrankaInterpolationController] SERVOL to",
-                                      target_pose, "over", duration_cmd, "s")
+                            # NEW: only treat as new if pose changed enough
+                            if np.linalg.norm(target_pose - last_goal_pose) > pose_eps:
+                                goal_pose = target_pose
+                                goal_arrival_time = now + duration_cmd
+                                last_goal_pose = goal_pose.copy()
+                                last_cmd_time = now
+
+                                if self.verbose:
+                                    print("[FrankaInterpolationController] SERVOL to",
+                                          target_pose, "over", duration_cmd, "s")
+                            # else: same pose → do not extend goal_arrival_time
 
                         elif cmd_type == Command.SCHEDULE_WAYPOINT.value:
                             target_pose = np.array(command['target_pose'], dtype=float)
@@ -386,12 +398,18 @@ class FrankaInterpolationController(mp.Process):
                             target_time_mono = mono_offset + target_time_wall
 
                             duration_cmd = max(target_time_mono - now, outer_dt)
-                            goal_pose = target_pose
-                            goal_arrival_time = now + duration_cmd
 
-                            if self.verbose:
-                                print("[FrankaInterpolationController] SCHEDULE_WAYPOINT to",
-                                      target_pose, "arrive in", duration_cmd, "s")
+                            # NEW: same de-bounce logic
+                            if np.linalg.norm(target_pose - last_goal_pose) > pose_eps:
+                                goal_pose = target_pose
+                                goal_arrival_time = now + duration_cmd
+                                last_goal_pose = goal_pose.copy()
+                                last_cmd_time = now
+
+                                if self.verbose:
+                                    print("[FrankaInterpolationController] SCHEDULE_WAYPOINT to",
+                                          target_pose, "arrive in", duration_cmd, "s")
+                            # else: repeated waypoint → ignore
 
                         else:
                             keep_running = False
@@ -420,6 +438,20 @@ class FrankaInterpolationController(mp.Process):
                 R_goal = st.Rotation.from_rotvec(goal_pose[3:])
                 R_err = R_goal * R_cmd.inv()
                 rot_err = R_err.as_rotvec()      # “shortest” rotation from cmd→goal
+
+                # --- NEW: idle lock to kill drift / back-and-forth ---
+                time_since_cmd = now - last_cmd_time
+                if time_since_cmd > idle_timeout:
+                    pos_err_norm = np.linalg.norm(pos_err)
+                    rot_err_norm = np.linalg.norm(rot_err)
+                    # thresholds: tune for how "firm" the stop should be
+                    if pos_err_norm < 1e-4 and rot_err_norm < 5e-3:
+                        # Snap goal to current pose and zero velocity
+                        goal_pose = cmd_pose.copy()
+                        cmd_vel[:] = 0.0
+                        pos_err[:] = 0.0
+                        rot_err[:] = 0.0
+                        goal_arrival_time = now
 
                 # If we have time_to_goal>0, aim to arrive in that time.
                 time_to_goal = goal_arrival_time - now
