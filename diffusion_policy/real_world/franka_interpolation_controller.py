@@ -65,10 +65,12 @@ class FrankaInterpolationController(mp.Process):
         shm_manager: SharedMemoryManager,
         robot_ip,
         frequency=100,
-        max_pos_speed=0.01,       # [m/s]
-        max_rot_speed=0.05,        # [rad/s]
-        max_pos_acc=0.05,          # [m/s^2]
-        max_rot_acc=0.10,          # [rad/s^2]
+        max_pos_speed=0.10,       # [m/s]
+        max_rot_speed=0.20,        # [rad/s]
+        max_pos_acc=0.10,          # [m/s^2]
+        max_rot_acc=0.20,          # [rad/s^2]
+        tau_pos=0.08,      # [s] time constant for position
+        tau_rot=0.12,      # [s] time constant for rotation
         launch_timeout=3.0,
         tcp_offset_pose=None,
         payload_mass=None,
@@ -110,6 +112,8 @@ class FrankaInterpolationController(mp.Process):
         self.max_rot_speed = max_rot_speed
         self.max_pos_acc = max_pos_acc
         self.max_rot_acc = max_rot_acc
+        self.tau_pos = tau_pos
+        self.tau_rot = tau_rot
         self.launch_timeout = launch_timeout
         self.tcp_offset_pose = tcp_offset_pose
         self.payload_mass = payload_mass
@@ -439,30 +443,49 @@ class FrankaInterpolationController(mp.Process):
                 R_err = R_goal * R_cmd.inv()
                 rot_err = R_err.as_rotvec()      # “shortest” rotation from cmd→goal
 
+                # --- dead zone on errors to avoid tiny drift and hard stopping ---
+                pos_err_norm = np.linalg.norm(pos_err)
+                rot_err_norm = np.linalg.norm(rot_err)
+
+                pos_dead = 1e-4     # ~0.1 mm
+                rot_dead = 5e-3     # ~0.3 degrees
+
+                if pos_err_norm < pos_dead:
+                    pos_err[:] = 0.0
+                if rot_err_norm < rot_dead:
+                    rot_err[:] = 0.0
+
+
                 # --- NEW: idle lock to kill drift / back-and-forth ---
-                time_since_cmd = now - last_cmd_time
-                if time_since_cmd > idle_timeout:
-                    pos_err_norm = np.linalg.norm(pos_err)
-                    rot_err_norm = np.linalg.norm(rot_err)
-                    # thresholds: tune for how "firm" the stop should be
-                    if pos_err_norm < 1e-4 and rot_err_norm < 5e-3:
-                        # Snap goal to current pose and zero velocity
-                        goal_pose = cmd_pose.copy()
-                        cmd_vel[:] = 0.0
-                        pos_err[:] = 0.0
-                        rot_err[:] = 0.0
-                        goal_arrival_time = now
+                # time_since_cmd = now - last_cmd_time
+                # if time_since_cmd > idle_timeout:
+                #     pos_err_norm = np.linalg.norm(pos_err)
+                #     rot_err_norm = np.linalg.norm(rot_err)
+                #     # thresholds: tune for how "firm" the stop should be
+                #     if pos_err_norm < 1e-4 and rot_err_norm < 5e-3:
+                #         # Snap goal to current pose and zero velocity
+                #         goal_pose = cmd_pose.copy()
+                #         cmd_vel[:] = 0.0
+                #         pos_err[:] = 0.0
+                #         rot_err[:] = 0.0
+                #         goal_arrival_time = now
 
-                # If we have time_to_goal>0, aim to arrive in that time.
-                time_to_goal = goal_arrival_time - now
-                if time_to_goal <= 0.0:
-                    vel_des = np.zeros(6, dtype=float)
-                else:
-                    v_pos_des = pos_err / time_to_goal
-                    v_rot_des = rot_err / time_to_goal
-                    vel_des = np.concatenate([v_pos_des, v_rot_des])
+                # === (3b) τ-based tracking instead of deadline-based tracking ===
+                # Position and orientation errors are driven down with a fixed time constant.
+                # Smaller τ → more reactive; larger τ → softer.
 
-                # --- clamp velocity ---
+                tau_pos = getattr(self, "tau_pos", 0.08)   # fallback if not set in __init__
+                tau_rot = getattr(self, "tau_rot", 0.12)
+
+                # Avoid degenerate small values
+                tau_pos = max(tau_pos, 1e-3)
+                tau_rot = max(tau_rot, 1e-3)
+
+                v_pos_des = pos_err / tau_pos
+                v_rot_des = rot_err / tau_rot
+                vel_des = np.concatenate([v_pos_des, v_rot_des])
+
+                # --- clamp velocity (unchanged) ---
                 v_pos_des = vel_des[:3]
                 v_rot_des = vel_des[3:]
 
